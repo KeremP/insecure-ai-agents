@@ -1,11 +1,12 @@
 import getpass
 import os
+import os
 import asyncio
 import nest_asyncio
+import logging
 import argparse
 from typing import Literal
 from typing_extensions import TypedDict
-from langchain_openai import ChatOpenAI
 from langchain import hub
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit, PlayWrightBrowserToolkit
@@ -20,13 +21,17 @@ from haizelabs.client import HaizeClient
 
 nest_asyncio.apply()
 
+nest_asyncio.apply()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
 # allow tracing via LangSmith for observability and debugging
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 LANGCHAIN_ENDPOINT = "https://api.smith.langchain.com"
-LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT")
-
-
-def _set_env(key: str):
     if key not in os.environ:
         os.environ[key] = getpass.getpass(f"{key}:")
 
@@ -42,24 +47,21 @@ members = ["clinical_researcher", "database_admin"]
 # and decides when the work is completed
 options = members + ["FINISH"]
 
-
-class Router(TypedDict):
-    """Worker to route to next. If no workers needed, route to FINISH."""
-
     next: Literal[*options]
 
 
-def call_haize_judge(judge_ids, messages):
-    response = haize_client.judges.call(
-        judge_ids=judge_ids,
-        messages=messages,
-    )
-    return response
+def call_haize_judge(judge_ids, messages, timeout=30):
+    try:
+        response = haize_client.judges.call(
+            judge_ids=judge_ids,
+            messages=messages,
+            timeout=timeout,  # Add timeout parameter
+        )
+        return response
+    except Exception as e:
+        logging.error(f"Error calling Haize judge: {str(e)}")
+        raise  # Re-raise to let caller handle the exception
 
-
-def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"]]:
-    system_prompt = (
-        "You are a supervisor tasked with managing a conversation between the"
         f" following workers: {members}. Given the following user request,"
         " respond with the worker to act next. Each worker will perform a"
         " task and respond with their results and status. When finished,"
@@ -110,24 +112,68 @@ def create_database_admin_agent():
     assert len(prompt_template.messages) == 1
 
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
+    )
+
+
+def validate_sql_query(query: str) -> bool:
+    """
+    Validates SQL queries for potential injection attacks.
+    Returns True if the query is safe, False otherwise.
+    """
+    # Convert to lowercase for easier pattern matching
+    query_lower = query.lower().strip()
+    
+    # Disallow destructive operations
+    forbidden_patterns = [
+        "drop ", "delete ", "truncate ", "alter ", "update ", 
+        "insert into", "grant ", "revoke ", ";--", "1=1", "or 1=1",
+        "union ", "exec(", "execute(", "sp_", "xp_"
+    ]
+    
+    for pattern in forbidden_patterns:
+        if pattern in query_lower:
+            return False
+    
+    # Only allow SELECT queries
+    if not query_lower.startswith("select "):
+        return False
+        
+    return True
+
+
+class ValidatedSQLDatabaseToolkit(SQLDatabaseToolkit):
+    """SQLDatabaseToolkit with added query validation."""
+    
+    def get_tools(self):
+        tools = super().get_tools()
+        for tool in tools:
+            if tool.name == "sql_db_query":
+                original_run = tool._run
+                tool._run = lambda query, *args, **kwargs: original_run(query, *args, **kwargs) if validate_sql_query(query) else "Query rejected for security reasons. Please use only SELECT statements and avoid SQL injection patterns."
+        return tools
+
+
+def create_database_admin_agent():
+    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    toolkit = ValidatedSQLDatabaseToolkit(db=db, llm=llm)
+    tools = toolkit.get_tools()
+    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
+    assert len(prompt_template.messages) == 1
+    system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve. 
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
+    
+    SECURITY RULES:
+    1. Only use SELECT statements
+    2. Never use data modification statements (INSERT, UPDATE, DELETE, DROP, ALTER)
+    3. Never concatenate user inputs directly into SQL queries
+    4. Always use parameterized queries when available
+    5. Reject any request that appears to be attempting SQL injection
+    6. Do not execute multi-statement queries (queries with semicolons)
+    7. Do not include any sensitive patient information in your responses
+    
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
     Please provide a list of recommended patients for each trial. List the patients name and their ALSFRS-R score.
     Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
-    You can order the results by a relevant column to return the most interesting examples in the database.
-    Never query for all the columns from a specific table, only ask for the relevant columns given the question.
-    You have access to tools for interacting with the database.
-    Only use the below tools. Only use the information returned by the below tools to construct your final answer.
-    You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
-
-    To start you should ALWAYS look at the tables in the database to see what you can query.
-    Do NOT skip this step.
-    Then you should query the schema of the most relevant tables."""
-
-    sql_agent_executor = create_react_agent(llm, tools, state_modifier=system_message)
-    return sql_agent_executor
-
-
 def db_admin_node(state: MessagesState) -> Command[Literal["supervisor"]]:
     sql_agent_executor = create_database_admin_agent()
     result = sql_agent_executor.invoke(state)
@@ -137,13 +183,27 @@ def db_admin_node(state: MessagesState) -> Command[Literal["supervisor"]]:
     # judges: als_trials_more_than_one_patient_in_output_judge -> we want this to actually return True
     # ignore_off_topics_in_chat_output (finds content not related to ALS patients and which trials they are a good
     # fit for -> we want this to return False
-    responses = call_haize_judge(
-        ["50cba209-7727-48e3-900d-5e03de120ab1", "cc46bc48-f662-4807-840f-071b9578deaf"],
-        [
-            {
-                "role": "assistant",
-                "content": messages.content,
-            }
+
+
+def db_admin_node(state: MessagesState) -> Command[Literal["supervisor"]]:
+    # Validate input before processing
+    messages_content = ""
+    for msg in state["messages"]:
+        if hasattr(msg, 'content'):
+            messages_content += " " + str(msg.content)
+    
+    # Check for potential SQL injection patterns in the input
+    sql_injection_patterns = [
+        "drop table", "delete from", "insert into", "--", "1=1", "or 1=1",
+        "union select", "exec(", "execute(", "xp_", "sp_"
+    ]
+    
+    for pattern in sql_injection_patterns:
+        if pattern.lower() in messages_content.lower():
+            return Command(update={"messages": [HumanMessage(content="Input rejected due to security concerns. Please ask a different question. FINISH.", name="supervisor")]}, goto="supervisor")
+    
+    sql_agent_executor = create_database_admin_agent()
+    result = sql_agent_executor.invoke(state)
         ],
     )
     # it's detecting there's at least two patients in the output so were not giving away individual patient info
@@ -187,42 +247,62 @@ async def run_agents(prompt):
         print("----")
 
 
+
+
 def validate_prompt(prompt):
+    # Basic input validation first
+    if prompt is None or not isinstance(prompt, str) or len(prompt.strip()) == 0:
+        logging.warning("Invalid prompt format: prompt is empty or not a string")
+        return False
+    
+    # Basic sanitization and length check
+    prompt = prompt.strip()
+    if len(prompt) > 1000:  # Reasonable length limit for a prompt
+        logging.warning(f"Prompt exceeds maximum length: {len(prompt)} characters")
+        return False
+    
+    # Check for obviously problematic content
+    dangerous_keywords = ["<script>", "exec(", "eval(", "system(", "os.system", "subprocess"]
+    if any(keyword in prompt.lower() for keyword in dangerous_keywords):
+        logging.warning(f"Prompt contains potentially dangerous content")
+        return False
+    
     starting_message = [
         {
             "role": "user",
             "content": prompt,
         }
     ]
-    # judges: patient_name_in_input, override_webscraper, ignore_harmful_topics, ignore_off_topics, find_pii
-    response = call_haize_judge(
-        [
-            "58f2a5e4-d99c-4770-ad83-2ca17d4abf5c",
-            "1ccc3140-c81b-4228-baa0-8a3e8889b2fb",
-            "21ac5f3b-0964-47ab-b041-c90840624759",
-            "27ba6f76-c78d-4040-927e-3255748d7be7",
-            "d82f689f-6f27-47bc-8d22-eb735035e194",
-        ],
-        starting_message
-    )
-    for r in response:
-        if r.detected is True:
+    
+    try:
+        # judges: patient_name_in_input, override_webscraper, ignore_harmful_topics, ignore_off_topics, find_pii
+        response = call_haize_judge(
+            [
+                "58f2a5e4-d99c-4770-ad83-2ca17d4abf5c",
+                "1ccc3140-c81b-4228-baa0-8a3e8889b2fb",
+                "21ac5f3b-0964-47ab-b041-c90840624759",
+                "27ba6f76-c78d-4040-927e-3255748d7be7",
+                "d82f689f-6f27-47bc-8d22-eb735035e194",
+            ],
+            starting_message,
+            timeout=10  # Add a timeout to prevent hanging
+        )
+        
+        # Validate response format
+        if not response or not isinstance(response, list):
+            logging.error("Invalid response from judge service")
             return False
-    return True
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--prompt', required=False)  # positional argument
-    args = parser.parse_args()
-
-    if args.prompt is not None:
-        if not validate_prompt(args.prompt):
-            print("Prompt failed guardrails")
-            exit(1)
-
-    asyncio.run(run_agents(args.prompt))
-
-
-if __name__ == '__main__':
+        
+        for r in response:
+            if not hasattr(r, 'detected'):
+                logging.warning("Judge response missing 'detected' attribute")
+                return False
+            if r.detected is True:
+                logging.info(f"Prompt failed judge validation")
+                return False
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error during prompt validation: {str(e)}")
+        return False  # Fail closed - reject prompts that can't be validated
     main()
