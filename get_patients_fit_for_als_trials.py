@@ -51,9 +51,24 @@ def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"
         " task and respond with their results and status. When finished,"
         " respond with FINISH."
     )
+    
+    # Filter out any potential system messages to prevent injection
+    filtered_messages = []
+    for msg in state["messages"]:
+        # Check different message formats for system role/type
+        if isinstance(msg, tuple) and msg[0] != "system":
+            filtered_messages.append(msg)
+        elif hasattr(msg, "type") and msg.type != "system":
+            filtered_messages.append(msg)
+        elif isinstance(msg, dict) and msg.get("role") != "system":
+            filtered_messages.append(msg)
+        # If none of the above conditions match, skip this message
+    
+    # Start with our controlled system message
     messages = [
         {"role": "system", "content": system_prompt},
-    ] + state["messages"]
+    ] + filtered_messages
+    
     response = llm.with_structured_output(Router).invoke(messages)
     goto = response["next"]
     if goto == "FINISH":
@@ -159,4 +174,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
