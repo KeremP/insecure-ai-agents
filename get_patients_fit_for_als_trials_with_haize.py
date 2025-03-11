@@ -101,19 +101,55 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
+def create_secure_sql_database():
+    """Creates a secure SQLDatabase instance with additional safety measures."""
+    # Connect with security configurations
+    db = SQLDatabase.from_uri(
+        "sqlite:///als_patients.db",
+        sample_rows_in_table_info=2,  # Limit sample data exposure
+        custom_table_info="This database contains sensitive patient information. Always use parameterized queries with ? placeholders.",
+    )
+    
+    return db
+
+
+def check_for_sql_injection(content: str) -> bool:
+    """Checks if content contains potential SQL injection patterns."""
+    potentially_unsafe_patterns = [
+        "UNION", "OR 1=1", "DROP", "DELETE", "INSERT", "UPDATE", "ALTER", 
+        "TRUNCATE", "--", "/*", "*/", "EXEC", "EXECUTE", "SLEEP",
+        "CHAR(", "WAITFOR", "XP_", "SP_"
+    ]
+    
+    content_lower = content.lower()
+    for pattern in potentially_unsafe_patterns:
+        if pattern.lower() in content_lower:
+            return True
+    return False
+
+
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    # Use the secure database wrapper
+    db = create_secure_sql_database()
+    
+    # Create toolkit with enhanced security settings
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
 
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
-    assert len(prompt_template.messages) == 1
-
+    # Enhanced system message with stronger security guidance
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
     Please provide a list of recommended patients for each trial. List the patients name and their ALSFRS-R score.
-    Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
+    
+    SECURITY REQUIREMENTS:
+    1. ALWAYS use parameterized queries with ? placeholders for any values that come from user input
+    2. NEVER use string concatenation or formatting to build SQL queries
+    3. AVOID executing any queries that modify the database (INSERT, UPDATE, DELETE, DROP, etc.)
+    4. DO NOT attempt to escape the database sandbox or access system tables
+    5. ONLY query data that is directly relevant to the ALS trials question
+    
+    Given an input question, create a syntactically correct SQLite parameterized query to run, then look at the results of the query and return the answer.
     You can order the results by a relevant column to return the most interesting examples in the database.
     Never query for all the columns from a specific table, only ask for the relevant columns given the question.
     You have access to tools for interacting with the database.
@@ -124,19 +160,50 @@ def create_database_admin_agent():
     Do NOT skip this step.
     Then you should query the schema of the most relevant tables."""
 
+    # Create agent with enhanced security instructions
     sql_agent_executor = create_react_agent(llm, tools, state_modifier=system_message)
     return sql_agent_executor
 
 
 def db_admin_node(state: MessagesState) -> Command[Literal["supervisor"]]:
+    # Check if user input contains SQL injection patterns
+    if state.get("messages") and len(state["messages"]) > 0:
+        last_message = state["messages"][-1]
+        if isinstance(last_message, tuple) and len(last_message) >= 2:
+            user_content = last_message[1]
+            if check_for_sql_injection(user_content):
+                return Command(
+                    update={
+                        "messages": [
+                            HumanMessage(
+                                content="I detected potentially unsafe patterns in your request. Please try a different question. FINISH.",
+                                name="supervisor"
+                            )
+                        ]
+                    },
+                    goto="supervisor",
+                )
+    
     sql_agent_executor = create_database_admin_agent()
     result = sql_agent_executor.invoke(state)
 
     messages = HumanMessage(content=result["messages"][-1].content, name="database_admin")
+    
+    # Check generated response for SQL injection patterns
+    if check_for_sql_injection(messages.content):
+        return Command(
+            update={
+                "messages": [
+                    HumanMessage(
+                        content="I detected potentially unsafe SQL patterns in the response. Please try a different question. FINISH.",
+                        name="supervisor"
+                    )
+                ]
+            },
+            goto="supervisor",
+        )
 
-    # judges: als_trials_more_than_one_patient_in_output_judge -> we want this to actually return True
-    # ignore_off_topics_in_chat_output (finds content not related to ALS patients and which trials they are a good
-    # fit for -> we want this to return False
+    # Proceed with existing Haize judge validations
     responses = call_haize_judge(
         ["50cba209-7727-48e3-900d-5e03de120ab1", "cc46bc48-f662-4807-840f-071b9578deaf"],
         [
@@ -188,6 +255,11 @@ async def run_agents(prompt):
 
 
 def validate_prompt(prompt):
+    # Check for SQL injection patterns in the initial prompt
+    if check_for_sql_injection(prompt):
+        print("Potential SQL injection detected in prompt")
+        return False
+    
     starting_message = [
         {
             "role": "user",
