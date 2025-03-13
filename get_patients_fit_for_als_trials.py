@@ -51,10 +51,42 @@ def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"
         " task and respond with their results and status. When finished,"
         " respond with FINISH."
     )
-    messages = [
+    
+    # Always start with our system message
+    formatted_messages = [
         {"role": "system", "content": system_prompt},
-    ] + state["messages"]
-    response = llm.with_structured_output(Router).invoke(messages)
+    ]
+    
+    # Convert state messages to a safe format
+    for msg in state["messages"]:
+        if isinstance(msg, tuple) and len(msg) >= 2:
+            role, content = str(msg[0]), str(msg[1])
+            # Ensure role is not 'system'
+            if role.lower() == "system":
+                role = "user"
+            formatted_messages.append({"role": role, "content": content})
+        elif hasattr(msg, "content") and hasattr(msg, "type"):
+            # Handle message objects like HumanMessage
+            role = "user" if getattr(msg, "type", "").lower() == "human" else getattr(msg, "type", "user").lower()
+            # Ensure role is not 'system'
+            if role.lower() == "system":
+                role = "user"
+            msg_dict = {"role": role, "content": str(getattr(msg, "content", ""))}
+            if hasattr(msg, "name"):
+                msg_dict["name"] = msg.name
+            formatted_messages.append(msg_dict)
+        elif isinstance(msg, dict) and "content" in msg:
+            # Handle dictionary messages
+            role = msg.get("role", "user")
+            # Ensure role is not 'system'
+            if role.lower() == "system":
+                role = "user"
+            msg_dict = {"role": role, "content": str(msg["content"])}
+            if "name" in msg:
+                msg_dict["name"] = msg["name"]
+            formatted_messages.append(msg_dict)
+    
+    response = llm.with_structured_output(Router).invoke(formatted_messages)
     goto = response["next"]
     if goto == "FINISH":
         goto = END
@@ -159,4 +191,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
