@@ -3,7 +3,7 @@ import os
 import asyncio
 import argparse
 import sqlite3
-from typing import Literal
+from typing import Literal, Tuple
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
 from langchain import hub
@@ -87,18 +87,76 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
+class SecureSQLDatabase(SQLDatabase):
+    """A secure wrapper around SQLDatabase that validates queries before execution."""
+    
+    def run(self, query: str) -> str:
+        """Run a SQL query and return the results."""
+        # Validate the query
+        is_valid, reason = self._validate_query(query)
+        if not is_valid:
+            return f"Error: {reason}. Please revise your query."
+        
+        # If valid, execute using the parent method
+        return super().run(query)
+    
+    def run_no_throw(self, query: str) -> str:
+        """Run a SQL query and return the results without throwing an exception."""
+        # Validate the query
+        is_valid, reason = self._validate_query(query)
+        if not is_valid:
+            return f"Error: {reason}. Please revise your query."
+        
+        # If valid, execute using the parent method
+        return super().run_no_throw(query)
+    
+    def _validate_query(self, query: str) -> Tuple[bool, str]:
+        """Validate SQL query to prevent dangerous operations."""
+        # Convert to lowercase for easier checking
+        query_lower = query.lower().strip()
+        
+        # Check for DML statements that modify data
+        dangerous_keywords = [
+            'insert into', 'update ', 'delete from', 'drop ', 'alter ', 
+            'truncate ', 'create ', 'replace ', 'exec ', 'execute ',
+            'xp_', 'sp_', '--', ';--'
+        ]
+        
+        for keyword in dangerous_keywords:
+            if keyword in query_lower:
+                return False, f"Query contains potentially dangerous operation: {keyword}"
+        
+        # Check for multiple statements
+        if ";" in query and not query.strip().endswith(";"):
+            return False, "Multiple SQL statements are not allowed"
+        
+        # Check for comment blocks that might be used for SQL injection
+        if "/*" in query_lower or "*/" in query_lower:
+            return False, "Comment blocks are not allowed"
+            
+        return True, "Query is valid"
+
+
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    # Use our secure database wrapper
+    db = SecureSQLDatabase.from_uri("sqlite:///als_patients.db")
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
 
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt:31156d5f")
-    assert len(prompt_template.messages) == 1
-
+    # Enhanced system message with more security instructions
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
     Please provide a list of recommended patients for each trial.
+    
+    SECURITY REQUIREMENTS:
+    - Only generate simple, secure SQL queries
+    - Never use multiple SQL statements separated by semicolons
+    - Never attempt to modify the database (no INSERT, UPDATE, DELETE, DROP, ALTER, etc.)
+    - Do not use SQL comments or comment blocks
+    - Avoid using any dangerous SQL functions or stored procedures
+    - Always use proper quoting for string values
+    
     Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
     You can order the results by a relevant column to return the most interesting examples in the database.
     Never query for all the columns from a specific table, only ask for the relevant columns given the question.
@@ -130,30 +188,50 @@ def db_admin_node(state: MessagesState) -> Command[Literal["supervisor"]]:
 
 
 async def run_agents(prompt):
-    builder = StateGraph(MessagesState)
-    builder.add_edge(START, "supervisor")
-    builder.add_node("supervisor", supervisor_node)
-    builder.add_node("clinical_researcher", clinical_researcher_node)
-    builder.add_node("database_admin", db_admin_node)
-    graph = builder.compile()
+    try:
+        builder = StateGraph(MessagesState)
+        builder.add_edge(START, "supervisor")
+        builder.add_node("supervisor", supervisor_node)
+        builder.add_node("clinical_researcher", clinical_researcher_node)
+        builder.add_node("database_admin", db_admin_node)
+        graph = builder.compile()
 
-    async for s in graph.astream(
-            {
-                "messages": [
-                    (
-                            "user",
-                            "Find ALS clinical trials, then recommend patients in the database for each trial"
-                            if prompt is None else prompt,
-                    )
-                ]
-            },
-            subgraphs=True,
-    ):
-        print(s)
-        print("----")
+        async for s in graph.astream(
+                {
+                    "messages": [
+                        (
+                                "user",
+                                "Find ALS clinical trials, then recommend patients in the database for each trial"
+                                if prompt is None else prompt,
+                        )
+                    ]
+                },
+                subgraphs=True,
+        ):
+            print(s)
+            print("----")
+    except Exception as e:
+        print(f"An error occurred during execution: {e}")
+        # Log error for further analysis
 
 
 def validate_prompt(prompt):
+    if prompt is None:
+        return True
+        
+    # Check for potential SQL injection patterns
+    sql_patterns = [
+        "select ", "insert ", "update ", "delete ", "drop ", "alter ", "create ", 
+        "truncate ", "union ", "exec ", "execute ", "--", ";", "/*", "*/"
+    ]
+    
+    prompt_lower = prompt.lower()
+    for pattern in sql_patterns:
+        if pattern in prompt_lower:
+            print(f"Potential SQL injection attempt detected: {pattern}")
+            return False
+    
+    # Original name validation logic
     con = sqlite3.connect("als_patients.db")
     cursor = con.cursor()
     result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
@@ -180,7 +258,7 @@ def main():
     parser.add_argument('--prompt', required=False)  # positional argument
     args = parser.parse_args()
 
-    if not validate_prompt(args.prompt):
+    if args.prompt is not None and not validate_prompt(args.prompt):
         print("Prompt failed guardrails")
         exit(1)
 
@@ -191,4 +269,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
