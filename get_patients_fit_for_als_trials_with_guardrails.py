@@ -3,6 +3,7 @@ import os
 import asyncio
 import argparse
 import sqlite3
+import re  # Added import for regular expressions
 from typing import Literal
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
@@ -154,25 +155,118 @@ async def run_agents(prompt):
 
 
 def validate_prompt(prompt):
-    con = sqlite3.connect("als_patients.db")
-    cursor = con.cursor()
-    result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
-    names_list_of_tuples = result.fetchall()
-    cursor.close()
-    list_of_names = []
-    for name in names_list_of_tuples:
-        full_name = name[0]
-        full_name = full_name.split(" ")
-        first = full_name[0]
-        last = full_name[1]
-        list_of_names.append(first)
-        list_of_names.append(last)
-    words_in_prompt = prompt.split(" ")
-    common_strings = set(list_of_names) & set(words_in_prompt)
+    """
+    Validate user prompt for potential security issues.
+    Return True if prompt passes all security checks, False otherwise.
+    """
+    # Check if prompt is None or empty
+    if prompt is None or not prompt.strip():
+        return False
+    
+    # Check for SQL injection patterns
+    # Common SQL keywords that could indicate injection when used in specific contexts
+    sql_keywords = [
+        "SELECT", "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "EXEC",
+        "UNION", "JOIN", "WHERE", "FROM", "INTO", "TRUNCATE"
+    ]
+    
+    # SQL injection patterns that are more specific and likely malicious
+    sql_injection_patterns = [
+        "--", "/*", "*/", ";", "OR 1=1", "' OR '", "\" OR \"", "OR TRUE", 
+        "SLEEP(", "WAITFOR DELAY", "BENCHMARK(", "UNION ALL SELECT"
+    ]
+    
+    # LLM injection patterns
+    llm_injection_patterns = [
+        "system:", "assistant:", "user:", "role:", "content:", 
+        "ignore previous", "disregard", "bypass", "override", "forget",
+        "instructions", "prompt", "system message", "new task"
+    ]
+    
+    # Check for specific SQL injection patterns (these are more likely to be malicious)
+    prompt_lower = prompt.lower()
+    for pattern in sql_injection_patterns:
+        if pattern.lower() in prompt_lower:
+            return False
+    
+    # For SQL keywords, check if they're used in a potentially malicious context
+    # This helps avoid flagging legitimate uses of these words in English sentences
+    words_in_prompt = prompt_lower.split()
+    for i, word in enumerate(words_in_prompt):
+        # Strip punctuation for comparison
+        clean_word = word.strip(",.;:!?\"'()[]{}").lower()
+        
+        if clean_word.upper() in sql_keywords:
+            # Check if the keyword is part of a potential SQL query pattern
+            # For example, "SELECT ... FROM ..." or "DROP TABLE ..."
+            if i < len(words_in_prompt) - 2:  # Ensure there are at least 2 more words
+                next_words = " ".join(words_in_prompt[i+1:i+3]).lower()
+                # Look for patterns that suggest SQL query construction
+                if "from" in next_words or "table" in next_words or "database" in next_words:
+                    return False
+    
+    # Check for LLM injection patterns
+    for pattern in llm_injection_patterns:
+        if pattern.lower() in prompt_lower:
+            return False
+    
+    # Check for attempts to directly manipulate agents by name
+    agent_names = ["charity", "steve", "clinical researcher", "database admin"]
+    agent_manipulation_patterns = [
+        "tell me about", "give me access", "show me", "reveal", "bypass", 
+        "ignore", "override", "new instructions"
+    ]
+    
+    # Check for combinations of agent names and manipulation patterns
+    for agent in agent_names:
+        for pattern in agent_manipulation_patterns:
+            combined_pattern = f"{pattern} {agent}"
+            if combined_pattern in prompt_lower or f"{agent}, {pattern}" in prompt_lower:
+                return False
+    
+    # Get patient names from database and check if they appear in the prompt
+    try:
+        con = sqlite3.connect("als_patients.db")
+        cursor = con.cursor()
+        result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
+        names_list_of_tuples = result.fetchall()
+        cursor.close()
+        con.close()
+    except sqlite3.Error:
+        # If we can't check against patient names, fail safe
+        return False
+    
+    # Process all patient names and check for matches in the prompt
+    patient_name_parts = []
+    
+    for name_tuple in names_list_of_tuples:
+        if not name_tuple or not name_tuple[0]:
+            continue
+        
+        full_name = name_tuple[0]
+        # Split the full name into parts (handles names with more than just first/last)
+        name_parts = full_name.split()
+        
+        for part in name_parts:
+            if len(part) > 2:  # Only consider name parts longer than 2 characters
+                patient_name_parts.append(part.lower())
+    
+    # Check if any words in the prompt match patient name parts
+    common_strings = set(patient_name_parts) & set(words_in_prompt)
+    
     if common_strings:
         return False
-    else:
-        return True
+    
+    # Additional check for partial matches (to catch slight variations)
+    for name_part in patient_name_parts:
+        if len(name_part) > 3:  # Only check substantial name parts
+            for word in words_in_prompt:
+                # Check if name part is contained within a word or vice versa
+                if name_part in word or (len(word) > 3 and word in name_part):
+                    return False
+    
+    # If we get here, prompt has passed all checks
+    return True
 
 
 def main():
@@ -180,7 +274,8 @@ def main():
     parser.add_argument('--prompt', required=False)  # positional argument
     args = parser.parse_args()
 
-    if not validate_prompt(args.prompt):
+    # Validate prompt if supplied, otherwise use default prompt
+    if args.prompt is not None and not validate_prompt(args.prompt):
         print("Prompt failed guardrails")
         exit(1)
 
@@ -191,4 +286,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
