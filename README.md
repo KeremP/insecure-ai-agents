@@ -1,7 +1,4 @@
-# insecure-ai-agents
-Examples of purposely insecure code for AI Agents
-
-## I created an AI Agent project that finds available ALS clinical trials and recommends patients for each trial.
+## An AI Agent project that finds available ALS clinical trials and recommends patients for each trial.
 
 ## create_patient_db.py 
 Creates a SQLite db with fake patient data with the following columns
@@ -21,17 +18,3 @@ Creates two worker agents supervised by another. One worker agent has access to 
 
 ## LangSmith Capture of a Successful Run
 https://smith.langchain.com/public/c132eb00-22f3-436c-87a1-3b8feca03a60/r
-
-
-## Security Review
-Explanation of the code and the vulnerabilities:
-https://secvendors.notion.site/Building-a-Multi-AI-Agent-System-16e3ec3e1cfe80c295fbc46e0ee40cf6
-
-Walkthrough of the exploits in the code and how to fix them:
-https://secvendors.notion.site/Exploiting-a-Multi-Agent-System-1713ec3e1cfe80f396adfbbe4cb483cd?pvs=73
-
-### Prompt Injection
-See a [video demo](https://x.com/vtahowe/status/1876364269962584271) of prompt injection done on this multi agent system
-
-### Excessive Agency
-See a [video demo](https://x.com/vtahowe/status/1876755660202749969) of excessive agency done on this multi agent system
