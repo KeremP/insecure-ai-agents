@@ -11,7 +11,7 @@ from langchain_community.tools.playwright.utils import create_async_playwright_b
 from langgraph.graph import MessagesState
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
 from langgraph.prebuilt import create_react_agent
 
 
@@ -44,20 +44,43 @@ class Router(TypedDict):
 
 
 def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"]]:
-    system_prompt = (
+    # Create a system message
+    system_content = (
         "You are a supervisor tasked with managing a conversation between the"
-        f" following workers: {members}. Given the following user request,"
+        f" following workers: {members}. Given the conversation history,"
         " respond with the worker to act next. Each worker will perform a"
         " task and respond with their results and status. When finished,"
         " respond with FINISH."
     )
-    messages = [
-        {"role": "system", "content": system_prompt},
-    ] + state["messages"]
-    response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
+    
+    # Start with a system message
+    formatted_messages = [SystemMessage(content=system_content)]
+    
+    # Convert and add the messages from state
+    if isinstance(state, dict) and "messages" in state:
+        for message in state["messages"]:
+            # Already a BaseMessage object
+            if isinstance(message, BaseMessage):
+                formatted_messages.append(message)
+            # Tuple format: (role, content)
+            elif isinstance(message, tuple) and len(message) == 2:
+                role, content = message
+                if role == "user":
+                    formatted_messages.append(HumanMessage(content=content))
+                elif role in members:
+                    formatted_messages.append(AIMessage(content=content, name=role))
+            # Skip other formats
+    
+    # Use structured output
+    response = llm.with_structured_output(Router).invoke(formatted_messages)
+    
+    # Get the next step, defaulting to the first member if there's an issue
+    goto = response.get("next", members[0])
+    
+    # Convert FINISH to END
     if goto == "FINISH":
         goto = END
+        
     return Command(goto=goto)
 
 
@@ -159,4 +182,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
