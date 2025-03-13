@@ -55,9 +55,15 @@ def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"
         {"role": "system", "content": system_prompt},
     ] + state["messages"]
     response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
-    if goto == "FINISH":
+    
+    # Validate LLM output before using it
+    goto = response.get("next", None)
+    if goto not in options:
+        print(f"Warning: LLM provided invalid next action '{goto}'. Defaulting to END.")
         goto = END
+    elif goto == "FINISH":
+        goto = END
+        
     return Command(goto=goto)
 
 
@@ -159,4 +165,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
