@@ -67,8 +67,17 @@ def create_clinical_research_agent():
 
     clinical_research_tools = clinical_research_toolkit.get_tools()
 
+    # Enhanced prompt to better constrain the LLM output
+    state_modifier = """You are an ALS clinical researcher. Your name is Charity. Search for ALS clinical trials on https://www.hopkinsmedicine.org/neurology-neurosurgery/clinical-trials/als-clinical-trials/open-trials. Extract text from on the webpage. Let Steve know the Length of Study for each trial.
+
+Important guidelines:
+1. Only provide factual information from the website
+2. Format your response as simple text with no markup, code, or scripts
+3. Focus only on trial details, especially Length of Study
+4. If you cannot find information, clearly state that"""
+
     clinical_research_agent = create_react_agent(
-        llm, tools=clinical_research_tools, state_modifier="You are a ALS clinical researcher. Your name is Charity. Search for ALS clinical trials on https://www.hopkinsmedicine.org/neurology-neurosurgery/clinical-trials/als-clinical-trials/open-trials. Extract text from on the webpage. Let Steve know the Length of Study for each trial."
+        llm, tools=clinical_research_tools, state_modifier=state_modifier
     )
     return clinical_research_agent
 
@@ -76,10 +85,21 @@ def create_clinical_research_agent():
 async def clinical_researcher_node(state: MessagesState) -> Command[Literal["supervisor"]]:
     clinical_research_agent = create_clinical_research_agent()
     result = await clinical_research_agent.ainvoke(state)
+    
+    # Extract the content from the last message
+    content = result["messages"][-1].content if result["messages"] and hasattr(result["messages"][-1], "content") else ""
+    
+    # Basic validation for empty or suspicious content
+    if not content:
+        content = "I was unable to retrieve information about ALS clinical trials."
+    elif any(pattern in content.lower() for pattern in ["<script", "javascript:", "function(", "eval(", "xhr.", "fetch("]):
+        print("WARNING: Potentially harmful content detected in LLM output")
+        content = "I encountered an issue while retrieving ALS clinical trial information. Please try again."
+    
     return Command(
         update={
             "messages": [
-                HumanMessage(content=result["messages"][-1].content, name="clinical_researcher")
+                HumanMessage(content=content, name="clinical_researcher")
             ]
         },
         goto="supervisor",
@@ -159,4 +179,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
