@@ -154,25 +154,54 @@ async def run_agents(prompt):
 
 
 def validate_prompt(prompt):
+    # Handle None case
+    if prompt is None:
+        return True  # No prompt means using the default, which is considered safe
+        
+    # Normalize the prompt: lowercase, remove special characters, collapse whitespace
+    normalized_prompt = ''.join(c.lower() for c in prompt if c.isalnum() or c.isspace())
+    normalized_prompt = ' '.join(normalized_prompt.split())
+    
+    # Create a set of standardized tokens from the prompt
+    prompt_tokens = set(normalized_prompt.split())
+    
+    # Also create a version with all non-alphanumeric chars removed to catch obfuscation
+    clean_prompt = ''.join(c for c in prompt.lower() if c.isalnum())
+    
     con = sqlite3.connect("als_patients.db")
     cursor = con.cursor()
     result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
     names_list_of_tuples = result.fetchall()
     cursor.close()
-    list_of_names = []
-    for name in names_list_of_tuples:
-        full_name = name[0]
-        full_name = full_name.split(" ")
-        first = full_name[0]
-        last = full_name[1]
-        list_of_names.append(first)
-        list_of_names.append(last)
-    words_in_prompt = prompt.split(" ")
-    common_strings = set(list_of_names) & set(words_in_prompt)
-    if common_strings:
-        return False
-    else:
-        return True
+    
+    for name_tuple in names_list_of_tuples:
+        full_name = name_tuple[0]
+        # Normalize the name too
+        normalized_name = ''.join(c.lower() for c in full_name if c.isalnum() or c.isspace())
+        normalized_name = ' '.join(normalized_name.split())
+        
+        # Check for full name matches
+        if normalized_name in normalized_prompt:
+            return False
+            
+        # Check for individual parts of the name
+        name_parts = normalized_name.split()
+        for part in name_parts:
+            if len(part) > 2:  # Only check name parts with at least 3 characters
+                # Check for exact substring match
+                if part in normalized_prompt:
+                    return False
+                
+                # Check for token match (whole word match)
+                if part in prompt_tokens:
+                    return False
+                
+                # Check for obfuscated names
+                clean_part = ''.join(c for c in part if c.isalnum())
+                if clean_part in clean_prompt:
+                    return False
+    
+    return True
 
 
 def main():
@@ -180,7 +209,8 @@ def main():
     parser.add_argument('--prompt', required=False)  # positional argument
     args = parser.parse_args()
 
-    if not validate_prompt(args.prompt):
+    # Validate prompt if provided
+    if args.prompt is not None and not validate_prompt(args.prompt):
         print("Prompt failed guardrails")
         exit(1)
 
@@ -191,4 +221,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
