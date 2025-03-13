@@ -1,6 +1,8 @@
 import getpass
 import os
 import asyncio
+import re
+from functools import wraps
 from typing import Literal
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
@@ -89,15 +91,67 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
 def create_database_admin_agent():
     db = SQLDatabase.from_uri("sqlite:///als_patients.db")
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-    tools = toolkit.get_tools()
-
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
-    assert len(prompt_template.messages) == 1
-
+    original_tools = toolkit.get_tools()
+    
+    # Create a list for our safe tools
+    safe_tools = []
+    
+    # Process each tool
+    for tool in original_tools:
+        # If it's the SQL query tool, wrap it with our security checks
+        if hasattr(tool, 'name') and tool.name == "sql_db_query":
+            # Store the original _run method
+            original_run = tool._run
+            
+            # Create a wrapper function with security checks
+            @wraps(original_run)
+            def safe_run(query, *args, **kwargs):
+                # Check for dangerous SQL operations
+                query_upper = query.upper()
+                if re.search(r'\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE)\b', query_upper):
+                    return "ERROR: This query contains forbidden SQL operations. Only SELECT statements are allowed."
+                
+                # Check for multiple statements
+                if query.count(';') > 1:
+                    return "ERROR: Multiple SQL statements are not allowed for security reasons."
+                
+                # Check for common SQL injection patterns
+                injection_patterns = [
+                    r'--',              # SQL comment
+                    r'/\*.*?\*/',       # Block comment
+                    r'\bOR\b.*?1\s*=\s*1', # OR 1=1
+                    r'\bOR\b.*?TRUE',   # OR TRUE
+                    r'\'.*?OR.*?\'',    # String-based OR injection
+                    r'".*?OR.*?"'       # Double-quote based OR injection
+                ]
+                
+                for pattern in injection_patterns:
+                    if re.search(pattern, query, re.IGNORECASE):
+                        return "ERROR: Potential SQL injection pattern detected in the query."
+                
+                # If all checks pass, execute the original function
+                return original_run(query, *args, **kwargs)
+            
+            # Replace the tool's _run method with our safe version
+            tool._run = safe_run
+        
+        # Add the tool to our safe tools list
+        safe_tools.append(tool)
+    
+    # Enhanced system message with security instructions
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
     Please provide a list of recommended patients for each trial.
+    
+    IMPORTANT SECURITY NOTICE:
+    The database system has implemented strict security controls:
+    - Only SELECT statements are permitted. All other SQL operations will be blocked.
+    - Multiple SQL statements (using semicolons) are not allowed and will be blocked.
+    - SQL comments (-- or /* */) are not allowed and will be blocked.
+    - Queries containing patterns that might indicate SQL injection will be blocked.
+    - Always use proper quoting and escaping for string values to prevent injection.
+    
     Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
     You can order the results by a relevant column to return the most interesting examples in the database.
     Never query for all the columns from a specific table, only ask for the relevant columns given the question.
@@ -111,7 +165,7 @@ def create_database_admin_agent():
     Do NOT skip this step.
     Then you should query the schema of the most relevant tables."""
 
-    sql_agent_executor = create_react_agent(llm, tools, state_modifier=system_message)
+    sql_agent_executor = create_react_agent(llm, safe_tools, state_modifier=system_message)
     return sql_agent_executor
 
 
@@ -159,4 +213,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
