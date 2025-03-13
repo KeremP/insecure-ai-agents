@@ -1,6 +1,8 @@
 import getpass
 import os
 import asyncio
+import re
+from functools import partial
 from typing import Literal
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
@@ -86,32 +88,93 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
+def is_safe_sql_query(query):
+    """Validates if a SQL query is safe to execute."""
+    if not query or not isinstance(query, str):
+        return False
+        
+    # Convert to lowercase for easier matching
+    query_lower = query.lower().strip()
+    
+    # Check for dangerous SQL operations
+    dangerous_keywords = [
+        "insert ", "update ", "delete ", "drop ", "alter ", "create ", 
+        "truncate ", "replace ", "exec ", "execute ", "xp_", "sp_",
+        "into outfile", "into dumpfile", "load_file", "load data",
+        "union ", "select sleep", "benchmark", "information_schema",
+        "sqlite_master", "sysobjects", "waitfor delay"
+    ]
+    
+    # Check for multi-statement attempts (excluding terminating semicolon)
+    if ";" in query_lower and not query_lower.endswith(";"):
+        return False
+    
+    # Check for presence of dangerous keywords
+    for keyword in dangerous_keywords:
+        if keyword in query_lower:
+            return False
+    
+    # Basic check that query starts with SELECT
+    if not query_lower.startswith("select "):
+        return False
+    
+    return True
+
+
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    # Create database connection with limited sample rows to reduce potential data exposure
+    db = SQLDatabase.from_uri("sqlite:///als_patients.db", sample_rows_in_table_info=2)
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
 
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
-    assert len(prompt_template.messages) == 1
+    # Define a secure wrapper function for SQL tools
+    def secure_sql_run(original_run, query, *args, **kwargs):
+        # Check if the query is safe
+        if not is_safe_sql_query(query):
+            return "Error: This query contains potentially unsafe operations and has been blocked for security reasons."
+        
+        # If it's safe, run the original method
+        return original_run(query, *args, **kwargs)
 
+    # Find SQL execution tools and add validation
+    for tool in tools:
+        if hasattr(tool, 'name') and "sql" in tool.name.lower() and hasattr(tool, '_run'):
+            # Store the original run method
+            original_run = tool._run
+            
+            # Create a partial function with the original run method bound
+            tool._run = partial(secure_sql_run, original_run)
+
+    # Enhanced system message with explicit security constraints
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
     Please provide a list of recommended patients for each trial.
+    
     Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
     You can order the results by a relevant column to return the most interesting examples in the database.
-    Never query for all the columns from a specific table, only ask for the relevant columns given the question.
+    
+    SECURITY RULES (MUST FOLLOW):
+    1. Never query for all the columns from a specific table, only ask for the relevant columns given the question.
+    2. DO NOT make ANY DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
+    3. DO NOT use comments in SQL that could be used to bypass security checks.
+    4. DO NOT attempt to combine multiple SQL statements with semicolons.
+    5. DO NOT create or modify database functions, triggers, or views.
+    6. DO NOT attempt to access system tables or metadata.
+    7. ONLY use SELECT statements for data retrieval.
+    8. DO NOT attempt SQL injection techniques or other security bypass methods.
+    
     You have access to tools for interacting with the database.
     Only use the below tools. Only use the information returned by the below tools to construct your final answer.
     You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
-
-    DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
-
+    
     To start you should ALWAYS look at the tables in the database to see what you can query.
     Do NOT skip this step.
     Then you should query the schema of the most relevant tables."""
 
+    # Create the SQL agent with our enhanced system message
     sql_agent_executor = create_react_agent(llm, tools, state_modifier=system_message)
+    
     return sql_agent_executor
 
 
@@ -159,4 +222,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
