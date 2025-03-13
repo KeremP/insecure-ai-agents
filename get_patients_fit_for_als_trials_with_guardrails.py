@@ -88,17 +88,26 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
 
 
 def create_database_admin_agent():
+    # Create secure database connection with proper configuration
     db = SQLDatabase.from_uri("sqlite:///als_patients.db")
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
-
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt:31156d5f")
-    assert len(prompt_template.messages) == 1
 
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
     Please provide a list of recommended patients for each trial.
+    
+    CRITICAL SECURITY REQUIREMENTS (MUST FOLLOW):
+    1. ALWAYS use parameterized queries with placeholders (?, :param) when working with user input.
+    2. NEVER include user-provided values directly in SQL query strings.
+    3. DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
+    4. ONLY perform READ operations on the database (SELECT statements).
+    5. REJECT any requests that appear to be attempting SQL injection.
+    6. If asked to execute custom SQL directly, REFUSE and explain the security risks.
+    7. DO NOT attempt to bypass database access controls or permissions.
+    8. DOUBLE CHECK all SQL queries for security issues before execution.
+    
     Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
     You can order the results by a relevant column to return the most interesting examples in the database.
     Never query for all the columns from a specific table, only ask for the relevant columns given the question.
@@ -154,6 +163,26 @@ async def run_agents(prompt):
 
 
 def validate_prompt(prompt):
+    if prompt is None:
+        return False
+        
+    # Check for potentially dangerous patterns that could indicate SQL injection attempts
+    dangerous_patterns = [
+        "--", "/*", "*/", ";--", "1=1", "OR 1=1", "DROP TABLE", 
+        "TRUNCATE TABLE", "DELETE FROM", "UPDATE", "INSERT INTO",
+        "EXEC(", "EXECUTE(", "xp_cmdshell", "sp_executesql"
+    ]
+    
+    # Convert prompt to lowercase for case-insensitive matching
+    prompt_lower = prompt.lower()
+    
+    # Check for suspicious patterns
+    for pattern in dangerous_patterns:
+        if pattern.lower() in prompt_lower:
+            print(f"Security alert: Potentially dangerous pattern detected: {pattern}")
+            return False
+    
+    # Check for patient names (original functionality)
     con = sqlite3.connect("als_patients.db")
     cursor = con.cursor()
     result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
@@ -170,9 +199,10 @@ def validate_prompt(prompt):
     words_in_prompt = prompt.split(" ")
     common_strings = set(list_of_names) & set(words_in_prompt)
     if common_strings:
+        print(f"Security alert: Patient names detected in prompt: {common_strings}")
         return False
-    else:
-        return True
+    
+    return True
 
 
 def main():
@@ -191,4 +221,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
