@@ -1,6 +1,7 @@
 import getpass
 import os
 import asyncio
+import re
 from typing import Literal
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
@@ -86,18 +87,76 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
+class SecureSQLDatabase(SQLDatabase):
+    """A more secure version of SQLDatabase with SQL injection protection."""
+    
+    @classmethod
+    def from_uri(cls, database_uri, *args, **kwargs):
+        # For SQLite, enforce read-only mode
+        if database_uri.startswith("sqlite:") and "?mode=ro" not in database_uri:
+            if "?" in database_uri:
+                database_uri += "&mode=ro"
+            else:
+                database_uri += "?mode=ro"
+        
+        return super().from_uri(database_uri, *args, **kwargs)
+    
+    def _is_safe_query(self, query: str) -> bool:
+        """Check if a SQL query is potentially unsafe."""
+        # Check for common SQL injection patterns
+        dangerous_patterns = [
+            r";\s*DROP\s+", 
+            r";\s*DELETE\s+",
+            r";\s*INSERT\s+",
+            r";\s*UPDATE\s+", 
+            r";\s*ALTER\s+",
+            r"UNION\s+SELECT",
+            r"--\s",
+            r"/\*.*\*/",
+        ]
+        
+        for pattern in dangerous_patterns:
+            if re.search(pattern, query, re.IGNORECASE):
+                return False
+        
+        # Prevent multiple statements
+        if query.count(';') > 1:
+            return False
+            
+        # Only allow SELECT statements
+        if not query.strip().upper().startswith('SELECT'):
+            return False
+            
+        return True
+    
+    def run(self, query: str, *args, **kwargs):
+        """Run a query with security validation."""
+        if not self._is_safe_query(query):
+            return "Query rejected for security reasons. Please use only simple SELECT statements."
+        
+        return super().run(query, *args, **kwargs)
+
+
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    # Use our secure SQLDatabase subclass with read-only connection
+    db = SecureSQLDatabase.from_uri("sqlite:///als_patients.db")
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
 
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
-    assert len(prompt_template.messages) == 1
-
+    # Enhanced system prompt with explicit security guidelines
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
     Please provide a list of recommended patients for each trial.
+    
+    SECURITY CONSTRAINTS (CRITICAL):
+    - ONLY use simple SELECT statements - no other SQL commands are allowed
+    - DO NOT use multiple SQL statements (no semicolons except at the end)
+    - DO NOT use subqueries with UNION
+    - AVOID complex joins that could be used for SQL injection
+    - NEVER attempt to modify database structure or data
+    - ALWAYS validate your query before executing
+    
     Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
     You can order the results by a relevant column to return the most interesting examples in the database.
     Never query for all the columns from a specific table, only ask for the relevant columns given the question.
@@ -159,4 +218,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
