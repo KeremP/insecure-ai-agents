@@ -1,7 +1,8 @@
 import getpass
 import os
 import asyncio
-from typing import Literal
+import re
+from typing import Literal, List
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
 from langchain import hub
@@ -13,6 +14,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
+from langchain_core.tools import BaseTool
 
 
 # allow tracing via LangSmith for observability and debugging
@@ -86,32 +88,138 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
+class SecureSQLDatabase:
+    """A wrapper around SQLDatabase that adds security measures."""
+    
+    def __init__(self, db: SQLDatabase):
+        self.db = db
+        # Patterns for detecting potentially harmful SQL
+        self.dangerous_patterns = [
+            r'\bDROP\b',
+            r'\bDELETE\b',
+            r'\bUPDATE\b',
+            r'\bINSERT\b',
+            r'\bALTER\b',
+            r'\bCREATE\b',
+            r'\bTRUNCATE\b',
+            r'\bEXEC\b',
+            r'\bUNION\b.*\bSELECT\b',
+            r'--',
+            r'\/\*.*\*\/',
+            r';.*'  # Prevent multiple statements
+        ]
+    
+    def validate_query(self, query: str) -> bool:
+        """Validate a SQL query for potentially harmful operations."""
+        query = query.strip().upper()
+        
+        # Check if query contains dangerous patterns
+        for pattern in self.dangerous_patterns:
+            if re.search(pattern, query, re.IGNORECASE):
+                return False
+                
+        # Only allow SELECT statements
+        if not query.startswith("SELECT"):
+            return False
+            
+        return True
+    
+    def run(self, query: str, *args, **kwargs) -> str:
+        """Run a SQL query with validation."""
+        if not self.validate_query(query):
+            return "Error: Query rejected due to security concerns. Only SELECT queries are allowed."
+        
+        # Execute the query through the underlying database
+        return self.db.run(query, *args, **kwargs)
+
+
+class SecureSQLTool(BaseTool):
+    """A wrapper around a SQL tool that adds security measures."""
+    
+    name: str
+    description: str 
+    wrapped_tool: BaseTool
+    secure_db: SecureSQLDatabase
+    
+    def _run(self, query: str, *args, **kwargs) -> str:
+        """Run the tool with validation."""
+        # If this is the query tool, validate the query
+        if "run" in self.name.lower() or "query" in self.name.lower():
+            if not self.secure_db.validate_query(query):
+                return "Error: Query rejected due to security concerns. Only SELECT queries are allowed."
+        
+        # Run the wrapped tool
+        return self.wrapped_tool._run(query, *args, **kwargs)
+    
+    async def _arun(self, query: str, *args, **kwargs) -> str:
+        """Run the tool asynchronously with validation."""
+        # If this is the query tool, validate the query
+        if "run" in self.name.lower() or "query" in self.name.lower():
+            if not self.secure_db.validate_query(query):
+                return "Error: Query rejected due to security concerns. Only SELECT queries are allowed."
+        
+        # Run the wrapped tool asynchronously
+        if hasattr(self.wrapped_tool, "_arun"):
+            return await self.wrapped_tool._arun(query, *args, **kwargs)
+        
+        # Fallback to synchronous run
+        return self.wrapped_tool._run(query, *args, **kwargs)
+
+
+def secure_sql_tools(tools: List[BaseTool], secure_db: SecureSQLDatabase) -> List[BaseTool]:
+    """Wrap SQL tools with secure versions."""
+    secure_tools = []
+    
+    for tool in tools:
+        # Create a secure wrapper around each SQL tool
+        secure_tool = SecureSQLTool(
+            name=tool.name,
+            description=tool.description + "\nNote: Only SELECT statements are allowed for security reasons.",
+            wrapped_tool=tool,
+            secure_db=secure_db
+        )
+        secure_tools.append(secure_tool)
+    
+    return secure_tools
+
+
 def create_database_admin_agent():
+    # Create the database connection
     db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    
+    # Create a secure wrapper around the database
+    secure_db = SecureSQLDatabase(db)
+    
+    # Create the toolkit with the original database for schema inspection
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+    
+    # Get the tools and wrap them with secure versions
     tools = toolkit.get_tools()
+    secure_tools = secure_sql_tools(tools, secure_db)
 
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
-    assert len(prompt_template.messages) == 1
-
+    # Enhanced system message with security warnings
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
     Please provide a list of recommended patients for each trial.
+    
+    SECURITY NOTICE: For security reasons, you are restricted to SELECT statements only. All other SQL operations (INSERT, UPDATE, DELETE, DROP, etc.) will be blocked.
+    
     Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
     You can order the results by a relevant column to return the most interesting examples in the database.
     Never query for all the columns from a specific table, only ask for the relevant columns given the question.
     You have access to tools for interacting with the database.
     Only use the below tools. Only use the information returned by the below tools to construct your final answer.
     You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
-
-    DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
+    
+    Use parameterized queries whenever possible by using placeholders like ? or :param instead of directly embedding values in your SQL statements.
 
     To start you should ALWAYS look at the tables in the database to see what you can query.
     Do NOT skip this step.
     Then you should query the schema of the most relevant tables."""
 
-    sql_agent_executor = create_react_agent(llm, tools, state_modifier=system_message)
+    # Create the agent with secure tools
+    sql_agent_executor = create_react_agent(llm, secure_tools, state_modifier=system_message)
     return sql_agent_executor
 
 
@@ -159,4 +267,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
