@@ -7,7 +7,7 @@ FVC Percentage: Refers to the Forced Vital Capacity percentage, showing varying 
 Bulbar-Onset Flag: Indicates if the ALS onset is bulbar (1) or limb (0).
 """
 import sqlite3
-import random
+import random  # Note: random is appropriate here as we're only generating fake test data, not security-sensitive values
 from datetime import datetime, timedelta
 import faker
 
@@ -38,6 +38,8 @@ cursor.execute('''CREATE TABLE patients (
 
 # Function to generate a fake ALS patient record
 def generate_fake_patient():
+    # Note: Using random module is appropriate here since we're only generating fake data
+    # for testing/demo purposes and not for any security or cryptographic operations
     name = fake.name()
     age = random.randint(30, 80)  # ALS mainly affects people between these ages
     gender = random.choice(['Male', 'Female'])
