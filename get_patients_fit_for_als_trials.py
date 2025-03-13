@@ -54,11 +54,40 @@ def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"
     messages = [
         {"role": "system", "content": system_prompt},
     ] + state["messages"]
-    response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
-    if goto == "FINISH":
-        goto = END
-    return Command(goto=goto)
+    
+    try:
+        response = llm.with_structured_output(Router).invoke(messages)
+        
+        # Validate that the next action is one of the expected options
+        goto = response.get("next", None)
+        if goto not in options:
+            # Log the unexpected response and terminate execution
+            print(f"Security Warning: LLM returned unexpected routing value: {goto}. Terminating execution.")
+            return Command(
+                update={
+                    "messages": [
+                        HumanMessage(content=f"Security alert: Invalid routing '{goto}' detected. Execution terminated.", name="system")
+                    ]
+                },
+                goto=END  # End execution for security
+            )
+        
+        if goto == "FINISH":
+            goto = END
+            
+        return Command(goto=goto)
+        
+    except Exception as e:
+        # Handle any exceptions during LLM invocation or processing
+        print(f"Error in supervisor_node: {e}")
+        return Command(
+            update={
+                "messages": [
+                    HumanMessage(content=f"Error in processing: {e}", name="system")
+                ]
+            },
+            goto=END  # End execution on error
+        )
 
 
 def create_clinical_research_agent():
@@ -159,4 +188,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
