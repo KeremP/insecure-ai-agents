@@ -21,13 +21,27 @@ os.environ["LANGCHAIN_TRACING_V2"] = "true"
 LANGCHAIN_ENDPOINT = "https://api.smith.langchain.com"
 LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT")
 
+# Security Note: 
+# For production environments, it's recommended to set environment variables
+# before running this script rather than storing credentials in code or
+# prompting for them during execution.
+# 
+# Example for setting environment variables securely:
+# Linux/macOS: export OPENAI_API_KEY=your_api_key
+# Windows: set OPENAI_API_KEY=your_api_key
 
-def _set_env(key: str):
+# Check for required environment variables and prompt for missing ones with a warning
+def check_env(key: str):
     if key not in os.environ:
-        os.environ[key] = getpass.getpass(f"{key}:")
+        print(f"WARNING: {key} not found in environment variables.")
+        print("For better security, set this as an environment variable before running:")
+        print(f"  Linux/macOS: export {key}=your_value")
+        print(f"  Windows: set {key}=your_value")
+        print(f"Falling back to prompt for this session only...")
+        os.environ[key] = getpass.getpass(f"{key}: ")
 
-
-_set_env("OPENAI_API_KEY")
+# Check for OpenAI API key
+check_env("OPENAI_API_KEY")
 
 # set llm and create team members for the lead agent to supervise
 llm = ChatOpenAI(model="gpt-4o-mini")
@@ -191,4 +205,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
