@@ -154,25 +154,44 @@ async def run_agents(prompt):
 
 
 def validate_prompt(prompt):
+    if prompt is None:
+        return True
+    
+    # Normalize the prompt for better matching
+    normalized_prompt = prompt.lower()
+    # Create a version with only alphanumeric chars for obfuscation detection
+    alphanumeric_prompt = ''.join(c for c in normalized_prompt if c.isalnum() or c.isspace())
+    words_in_prompt = normalized_prompt.split()
+    
     con = sqlite3.connect("als_patients.db")
     cursor = con.cursor()
     result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
     names_list_of_tuples = result.fetchall()
     cursor.close()
-    list_of_names = []
-    for name in names_list_of_tuples:
-        full_name = name[0]
-        full_name = full_name.split(" ")
-        first = full_name[0]
-        last = full_name[1]
-        list_of_names.append(first)
-        list_of_names.append(last)
-    words_in_prompt = prompt.split(" ")
-    common_strings = set(list_of_names) & set(words_in_prompt)
-    if common_strings:
-        return False
-    else:
-        return True
+    
+    for name_tuple in names_list_of_tuples:
+        full_name = name_tuple[0].lower()
+        name_parts = full_name.split()
+        
+        # Check if full name appears in prompt
+        if full_name in normalized_prompt:
+            return False
+        
+        # Check name parts (first and last name)
+        for part in name_parts:
+            if len(part) >= 3:  # Only check parts that are at least 3 chars
+                # Check as whole words
+                if part in words_in_prompt:
+                    return False
+                
+                # Check for obfuscated versions - only for longer names (4+ chars)
+                if len(part) >= 4:
+                    clean_part = ''.join(c for c in part if c.isalnum())
+                    # Check if name appears within alphanumeric prompt
+                    if clean_part in alphanumeric_prompt.replace(" ", ""):
+                        return False
+    
+    return True
 
 
 def main():
@@ -180,7 +199,7 @@ def main():
     parser.add_argument('--prompt', required=False)  # positional argument
     args = parser.parse_args()
 
-    if not validate_prompt(args.prompt):
+    if args.prompt is not None and not validate_prompt(args.prompt):
         print("Prompt failed guardrails")
         exit(1)
 
@@ -191,4 +210,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
