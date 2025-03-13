@@ -54,11 +54,21 @@ def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"
     messages = [
         {"role": "system", "content": system_prompt},
     ] + state["messages"]
-    response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
-    if goto == "FINISH":
-        goto = END
-    return Command(goto=goto)
+    
+    try:
+        response = llm.with_structured_output(Router).invoke(messages)
+        next_worker = response["next"]
+        
+        # Validate that the output is one of the allowed options
+        if next_worker not in options:
+            print(f"WARNING: LLM provided invalid next worker: {next_worker}. Defaulting to FINISH.")
+            next_worker = "FINISH"  # Default to FINISH as a safe fallback
+        
+        goto = END if next_worker == "FINISH" else next_worker
+        return Command(goto=goto)
+    except Exception as e:
+        print(f"ERROR in supervisor_node: {str(e)}. Defaulting to FINISH.")
+        return Command(goto=END)  # Default to END if any error occurs
 
 
 def create_clinical_research_agent():
@@ -159,4 +169,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
