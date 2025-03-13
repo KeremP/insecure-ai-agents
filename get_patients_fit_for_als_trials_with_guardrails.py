@@ -54,11 +54,42 @@ def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"
     messages = [
                    {"role": "system", "content": system_prompt},
                ] + state["messages"]
-    response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
-    if goto == "FINISH":
-        goto = END
-    return Command(goto=goto)
+    
+    # Set a default safe value in case of failure
+    default_action = END  # Safest default is to end the workflow if validation fails
+    
+    # Add retry logic with a maximum number of attempts
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            response = llm.with_structured_output(Router).invoke(messages)
+            
+            # Ensure the response has the expected structure
+            if not isinstance(response, dict) or "next" not in response:
+                raise ValueError("LLM response missing 'next' field")
+            
+            goto = response["next"]
+            
+            # Strict validation against allowed values only
+            valid_options = set(members + ["FINISH"])
+            if goto not in valid_options:
+                print(f"Security warning: LLM returned unexpected worker '{goto}'. Valid options are {valid_options}")
+                if attempt < max_attempts - 1:
+                    continue  # Try again rather than using an invalid value
+                goto = default_action
+            elif goto == "FINISH":
+                goto = END
+            
+            print(f"Routing workflow to: {goto}")
+            return Command(goto=goto)
+        except Exception as e:
+            print(f"Error processing LLM response (attempt {attempt+1}/{max_attempts}): {e}")
+            if attempt < max_attempts - 1:
+                continue
+            
+    # If we get here, all attempts failed
+    print(f"Security alert: Failed to get valid workflow routing after {max_attempts} attempts. Terminating workflow.")
+    return Command(goto=default_action)
 
 
 def create_clinical_research_agent():
@@ -191,4 +222,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
