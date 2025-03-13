@@ -1,7 +1,7 @@
 import getpass
 import os
 import asyncio
-from typing import Literal
+from typing import Literal, Dict
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
 from langchain import hub
@@ -21,16 +21,37 @@ LANGCHAIN_ENDPOINT = "https://api.smith.langchain.com"
 LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT")
 
 
+# Secure in-memory credential storage
+class CredentialManager:
+    _credentials: Dict[str, str] = {}
+    
+    @classmethod
+    def get_credential(cls, key: str) -> str:
+        return cls._credentials.get(key, "")
+    
+    @classmethod
+    def set_credential(cls, key: str, value: str) -> None:
+        cls._credentials[key] = value
+
+
 def _set_env(key: str):
-    if key not in os.environ:
-        os.environ[key] = getpass.getpass(f"{key}:")
+    # For sensitive keys like API keys, store in memory instead of environment
+    sensitive_keys = ["OPENAI_API_KEY"]
+    
+    if key in sensitive_keys:
+        if not CredentialManager.get_credential(key):
+            CredentialManager.set_credential(key, getpass.getpass(f"{key}:"))
+    else:
+        # For non-sensitive environment variables, continue using os.environ
+        if key not in os.environ:
+            os.environ[key] = getpass.getpass(f"{key}:")
 
 
 _set_env("OPENAI_API_KEY")
 
 
 # set llm and create team members for the lead agent to supervise
-llm = ChatOpenAI(model="gpt-4o-mini")
+llm = ChatOpenAI(model="gpt-4o-mini", api_key=CredentialManager.get_credential("OPENAI_API_KEY"))
 members = ["clinical_researcher", "database_admin"]
 # Our team supervisor is an LLM node. It picks the next agent to process
 # and decides when the work is completed
@@ -159,4 +180,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
