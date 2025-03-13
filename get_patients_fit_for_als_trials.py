@@ -44,6 +44,9 @@ class Router(TypedDict):
 
 
 def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"]]:
+    # Define the valid options upfront
+    valid_options = set(members + ["FINISH"])
+    
     system_prompt = (
         "You are a supervisor tasked with managing a conversation between the"
         f" following workers: {members}. Given the following user request,"
@@ -54,11 +57,23 @@ def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"
     messages = [
         {"role": "system", "content": system_prompt},
     ] + state["messages"]
-    response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
-    if goto == "FINISH":
-        goto = END
-    return Command(goto=goto)
+    
+    try:
+        response = llm.with_structured_output(Router).invoke(messages)
+        goto = response.get("next", "")
+        
+        # Validate that the response is one of the expected values
+        if goto not in valid_options:
+            print(f"Invalid routing response: {goto}. Defaulting to first team member.")
+            goto = members[0]  # Default to first team member as fallback
+        
+        if goto == "FINISH":
+            goto = END
+            
+        return Command(goto=goto)
+    except Exception as e:
+        print(f"Error in supervisor routing: {e}")
+        return Command(goto=members[0])  # Default to first team member in case of error
 
 
 def create_clinical_research_agent():
@@ -159,4 +174,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
