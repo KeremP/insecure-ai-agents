@@ -3,6 +3,7 @@ import os
 import asyncio
 import argparse
 import sqlite3
+import re
 from typing import Literal
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
@@ -87,27 +88,81 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
+def is_safe_sql_query(query):
+    """Determine if a SQL query is safe to execute"""
+    # Normalize the query for easier pattern matching
+    normalized_query = query.strip().upper()
+    
+    # Only allow queries that start with SELECT
+    if not normalized_query.startswith("SELECT"):
+        return False
+    
+    # Check for forbidden patterns that might indicate SQL injection
+    forbidden_patterns = [
+        r"\bINSERT\b",
+        r"\bUPDATE\b",
+        r"\bDELETE\b",
+        r"\bDROP\b",
+        r"\bALTER\b",
+        r"\bCREATE\b",
+        r"\bTRUNCATE\b",
+        r"\bEXEC\b",
+        r"\bEXECUTE\b",
+        r"--",
+        r";",
+        r"/\*",
+        r"\*/",
+        r"UNION\s+SELECT",
+        r"UNION\s+ALL\s+SELECT",
+    ]
+    
+    for pattern in forbidden_patterns:
+        if re.search(pattern, normalized_query, re.IGNORECASE):
+            return False
+    
+    return True
+
+
+def create_safe_db(uri):
+    """Creates a SQLDatabase with additional security measures"""
+    db = SQLDatabase.from_uri(uri)
+    original_run = db.run
+    
+    def safe_run(query, *args, **kwargs):
+        """Run a query after validating it is safe"""
+        
+        # Only allow SELECT statements that don't contain dangerous operations
+        if not is_safe_sql_query(query):
+            raise ValueError(f"Unsafe SQL query detected: {query}")
+        
+        return original_run(query, *args, **kwargs)
+    
+    # Replace the original run method with our safe version
+    db.run = safe_run
+    return db
+
+
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    db = create_safe_db("sqlite:///als_patients.db")
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
-
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt:31156d5f")
-    assert len(prompt_template.messages) == 1
 
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
     Please provide a list of recommended patients for each trial.
-    Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
+    
+    SECURITY CONSTRAINTS:
+    1. You MUST ONLY use SELECT statements to read data from the database.
+    2. You MUST NEVER use DML operations (INSERT, UPDATE, DELETE, DROP, etc.) or any SQL that modifies data.
+    3. You MUST NOT use multiple SQL statements separated by semicolons.
+    4. You MUST NOT use SQL comments (-- or /* */).
+    5. You MUST NOT use UNION queries or any other technique that might be used for SQL injection.
+    
+    Given an input question, create a syntactically correct and safe SQLite query to run, then look at the results of the query and return the answer.
     You can order the results by a relevant column to return the most interesting examples in the database.
     Never query for all the columns from a specific table, only ask for the relevant columns given the question.
-    You have access to tools for interacting with the database.
-    Only use the below tools. Only use the information returned by the below tools to construct your final answer.
-    You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
-
-    DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
-
+    
     To start you should ALWAYS look at the tables in the database to see what you can query.
     Do NOT skip this step.
     Then you should query the schema of the most relevant tables."""
@@ -154,25 +209,52 @@ async def run_agents(prompt):
 
 
 def validate_prompt(prompt):
-    con = sqlite3.connect("als_patients.db")
-    cursor = con.cursor()
-    result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
-    names_list_of_tuples = result.fetchall()
-    cursor.close()
-    list_of_names = []
-    for name in names_list_of_tuples:
-        full_name = name[0]
-        full_name = full_name.split(" ")
-        first = full_name[0]
-        last = full_name[1]
-        list_of_names.append(first)
-        list_of_names.append(last)
-    words_in_prompt = prompt.split(" ")
-    common_strings = set(list_of_names) & set(words_in_prompt)
-    if common_strings:
-        return False
-    else:
+    """Validate user prompt to prevent SQL injection and other attacks"""
+    if prompt is None:
         return True
+    
+    # Check for obvious SQL injection patterns
+    suspicious_patterns = [
+        ";", "--", "/*", "*/", "xp_", "EXEC(", "EXECUTE(", 
+        "UNION SELECT", "OR 1=1", "' OR '", "\" OR \"", 
+        "DROP TABLE", "ALTER TABLE", "DELETE FROM", "UPDATE SET"
+    ]
+    
+    # Convert prompt to lowercase for case-insensitive matching
+    lower_prompt = prompt.lower()
+    
+    # Check for suspicious patterns that might indicate injection attempts
+    for pattern in suspicious_patterns:
+        if pattern.lower() in lower_prompt:
+            print(f"Prompt failed security check: contains suspicious pattern '{pattern}'")
+            return False
+    
+    # Original check for patient names
+    try:
+        con = sqlite3.connect("als_patients.db")
+        cursor = con.cursor()
+        result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
+        names_list_of_tuples = result.fetchall()
+        cursor.close()
+        list_of_names = []
+        for name in names_list_of_tuples:
+            full_name = name[0]
+            full_name = full_name.split(" ")
+            first = full_name[0]
+            last = full_name[1]
+            list_of_names.append(first)
+            list_of_names.append(last)
+        words_in_prompt = prompt.split(" ")
+        common_strings = set(list_of_names) & set(words_in_prompt)
+        if common_strings:
+            print("Prompt failed security check: contains patient names")
+            return False
+    except Exception as e:
+        print(f"Error checking prompt against patient names: {e}")
+        # In case of database error, fail closed for security
+        return False
+    
+    return True
 
 
 def main():
@@ -180,7 +262,7 @@ def main():
     parser.add_argument('--prompt', required=False)  # positional argument
     args = parser.parse_args()
 
-    if not validate_prompt(args.prompt):
+    if args.prompt and not validate_prompt(args.prompt):
         print("Prompt failed guardrails")
         exit(1)
 
@@ -191,4 +273,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
