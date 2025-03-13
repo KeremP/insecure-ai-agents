@@ -3,7 +3,8 @@ import os
 import asyncio
 import argparse
 import sqlite3
-from typing import Literal
+import re
+from typing import Any, Dict, List, Optional, Tuple, Literal
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
 from langchain import hub
@@ -15,6 +16,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
+from sqlalchemy import create_engine
 
 # allow tracing via LangSmith for observability and debugging
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
@@ -41,6 +43,69 @@ class Router(TypedDict):
     """Worker to route to next. If no workers needed, route to FINISH."""
 
     next: Literal[*options]
+
+
+class SecureSQLDatabase(SQLDatabase):
+    """A secure version of SQLDatabase that validates queries before execution."""
+
+    @classmethod
+    def from_uri(
+        cls,
+        database_uri: str,
+        engine_args: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> "SecureSQLDatabase":
+        """Create a SecureSQLDatabase from a URI."""
+        _engine_args = engine_args or {}
+        return cls(create_engine(database_uri, **_engine_args), **kwargs)
+
+    def _validate_query(self, command: str) -> Tuple[bool, str]:
+        """Validate a SQL query to ensure it's safe."""
+        # Convert to lowercase for case-insensitive matching
+        command_lower = command.strip().lower()
+        
+        # Check for DML statements
+        dml_patterns = [
+            r'\binsert\b', r'\bupdate\b', r'\bdelete\b', r'\bdrop\b',
+            r'\balter\b', r'\bcreate\b', r'\btruncate\b', r'\bexec\b',
+            r'\bexecute\b', r'\binto\s+outfile\b', r'\binto\s+dumpfile\b',
+            r'\breplace\b', r'\bmerge\b', r'\btruncate\b', r'\bload\s+data\b',
+            r'\bset\b', r'\bcall\b', r'\bsavepoint\b', r'\btransaction\b',
+            r'\bcommit\b', r'\brollback\b'
+        ]
+        
+        for pattern in dml_patterns:
+            if re.search(pattern, command_lower):
+                return False, f"Contains forbidden operation ({pattern})"
+        
+        # Ensure it's a SELECT statement
+        if not command_lower.startswith("select"):
+            return False, "Only SELECT statements are allowed"
+        
+        # Additional checks for SQL injection techniques
+        if command_lower.count(";") > 1:
+            return False, "Multiple SQL statements are not allowed"
+        
+        if re.search(r'--\s+', command_lower) or "/*" in command_lower:
+            return False, "SQL comments are not allowed"
+            
+        return True, "Query validated successfully"
+
+    def run(self, command: str, fetch: str = "all", **kwargs: Any) -> str:
+        """Execute a SQL command and return a string representing the results."""
+        is_valid, message = self._validate_query(command)
+        if not is_valid:
+            return f"ERROR: {message}. The query was rejected for security reasons. Please try a different query using only SELECT statements."
+        
+        return super().run(command, fetch, **kwargs)
+    
+    def run_no_throw(self, command: str, fetch: str = "all", **kwargs: Any) -> str:
+        """Execute a SQL command and return a string representing the results without throwing errors."""
+        is_valid, message = self._validate_query(command)
+        if not is_valid:
+            return f"ERROR: {message}. The query was rejected for security reasons. Please try a different query using only SELECT statements."
+        
+        return super().run_no_throw(command, fetch, **kwargs)
 
 
 def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"]]:
@@ -88,7 +153,8 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
 
 
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    # Use our secure SQLDatabase instead of the original one
+    db = SecureSQLDatabase.from_uri("sqlite:///als_patients.db")
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
 
@@ -107,6 +173,8 @@ def create_database_admin_agent():
     You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
 
     DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
+    The system has a strict SQL validator that will reject any non-SELECT statements, multiple statements, SQL comments, and potentially harmful queries.
+    Only simple SELECT statements are allowed.
 
     To start you should ALWAYS look at the tables in the database to see what you can query.
     Do NOT skip this step.
@@ -191,4 +259,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
