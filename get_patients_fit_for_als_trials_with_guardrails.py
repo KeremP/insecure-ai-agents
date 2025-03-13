@@ -3,8 +3,10 @@ import os
 import asyncio
 import argparse
 import sqlite3
+import re
 from typing import Literal
 from typing_extensions import TypedDict
+from functools import wraps
 from langchain_openai import ChatOpenAI
 from langchain import hub
 from langchain_community.utilities import SQLDatabase
@@ -87,13 +89,63 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
-def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-    tools = toolkit.get_tools()
+def validate_sql_query(query: str) -> bool:
+    """Validate if a SQL query is safe to execute."""
+    # Convert to uppercase for case-insensitive matching
+    query_upper = query.upper()
+    
+    # Only allow SELECT statements
+    if not query_upper.strip().startswith('SELECT'):
+        return False
+            
+    # Check for dangerous patterns
+    dangerous_patterns = [
+        r'\bDROP\b',
+        r'\bDELETE\b',
+        r'\bINSERT\b',
+        r'\bUPDATE\b',
+        r'\bALTER\b',
+        r'\bCREATE\b',
+        r'\bTRUNCATE\b',
+        r'\bGRANT\b',
+        r'\bREVOKE\b',
+        r'\bUNION\b.*\bSELECT\b',  # Common for SQL injection
+        r'\bOR\b.*\b1\b\s*=\s*\b1\b',  # Common for SQL injection
+        r';.*',  # Prevent multiple statements
+        r'--',   # SQL comments that might be used in injection
+        r'/\*'   # Block multiline comments
+    ]
+    
+    for pattern in dangerous_patterns:
+        if re.search(pattern, query_upper, re.IGNORECASE):
+            return False
+                
+    return True
 
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt:31156d5f")
-    assert len(prompt_template.messages) == 1
+
+def secure_db_instance(db):
+    """Apply security wrapping to an existing SQLDatabase instance."""
+    original_run = db.run
+    
+    @wraps(original_run)
+    def secure_run(command, fetch="all"):
+        if not validate_sql_query(command):
+            raise ValueError("Query rejected for security reasons. Only SELECT queries with approved syntax are allowed.")
+        return original_run(command, fetch)
+    
+    # Replace the run method with our secure version
+    db.run = secure_run
+    
+    return db
+
+
+def create_database_admin_agent():
+    # Create the database and apply security
+    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    secure_db = secure_db_instance(db)
+    
+    toolkit = SQLDatabaseToolkit(db=secure_db, llm=llm)
+    tools = toolkit.get_tools()
 
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
@@ -106,7 +158,8 @@ def create_database_admin_agent():
     Only use the below tools. Only use the information returned by the below tools to construct your final answer.
     You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
 
-    DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
+    IMPORTANT: Only SELECT queries are allowed. All other SQL operations are blocked for security reasons.
+    Your queries will be validated before execution and rejected if they contain potentially unsafe operations.
 
     To start you should ALWAYS look at the tables in the database to see what you can query.
     Do NOT skip this step.
@@ -191,4 +244,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
