@@ -1,7 +1,8 @@
 import getpass
 import os
 import asyncio
-from typing import Literal
+import re
+from typing import Literal, Tuple
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
 from langchain import hub
@@ -86,13 +87,61 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
+def validate_sql_query(query: str) -> Tuple[bool, str]:
+    """
+    Validates that a SQL query is safe to execute by checking for disallowed operations.
+    Returns (is_valid, error_message) tuple.
+    """
+    # Convert query to lowercase for case-insensitive checks
+    query_lower = query.lower().strip()
+    
+    # Regular expressions for disallowed SQL operations
+    disallowed_patterns = [
+        r"\binsert\b",
+        r"\bupdate\b",
+        r"\bdelete\b",
+        r"\bdrop\b",
+        r"\btruncate\b",
+        r"\balter\b",
+        r"\bcreate\b",
+        r"\bgrant\b",
+        r"\brevoke\b",
+        r"\battach\b",
+        r"\bdetach\b",
+        r"\bpragma\b",
+        r"\bexec\b",
+        r"--",  # SQL comment that might be used to try to bypass validation
+        r"/\*"  # Start of block comment
+    ]
+    
+    # Check if any disallowed pattern is in the query
+    for pattern in disallowed_patterns:
+        if re.search(pattern, query_lower):
+            return False, f"Query contains disallowed SQL operation or pattern: {pattern}"
+    
+    # Ensure the query starts with SELECT
+    if not re.match(r"^\s*select\b", query_lower):
+        return False, "Only SELECT queries are allowed"
+    
+    return True, ""
+
+
+# Create a custom SQLDatabase class with validation
+class SafeSQLDatabase(SQLDatabase):
+    def run(self, command: str, fetch: str = "all") -> str:
+        """Run a SQL command with validation."""
+        is_valid, error_message = validate_sql_query(command)
+        if not is_valid:
+            return f"ERROR: SQL query validation failed: {error_message}. Please revise your query to use only SELECT statements."
+        
+        return super().run(command, fetch)
+
+
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    # Use our safe SQLDatabase instead of the regular one
+    db = SafeSQLDatabase.from_uri("sqlite:///als_patients.db")
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
-
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
-    assert len(prompt_template.messages) == 1
 
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
@@ -106,6 +155,8 @@ def create_database_admin_agent():
     You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
 
     DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
+    
+    Note: All queries are validated for safety, and unsafe queries will be rejected. Only SELECT statements are allowed.
 
     To start you should ALWAYS look at the tables in the database to see what you can query.
     Do NOT skip this step.
@@ -159,4 +210,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
