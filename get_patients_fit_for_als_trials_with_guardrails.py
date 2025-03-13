@@ -22,6 +22,52 @@ LANGCHAIN_ENDPOINT = "https://api.smith.langchain.com"
 LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT")
 
 
+# Function to validate SQL queries for safety
+def validate_sql_query(query: str) -> bool:
+    """
+    Validate SQL query to ensure it doesn't contain dangerous operations.
+    Returns True if the query is safe, False otherwise.
+    """
+    # Convert to lowercase for easier pattern matching
+    query_lower = query.lower().strip()
+    
+    # Disallow DML statements and other potentially dangerous operations
+    dangerous_keywords = [
+        'insert into', 'update ', 'delete from', 'drop ', 'alter ', 
+        'truncate ', 'create ', 'grant ', 'revoke ', 'exec ', 'execute ',
+        'xp_', 'sp_', '--', ';--', '/*', '*/', 'union select', 'union all select'
+    ]
+    
+    for keyword in dangerous_keywords:
+        if keyword in query_lower:
+            return False
+    
+    # Only allow SELECT statements
+    if not query_lower.startswith('select '):
+        return False
+        
+    return True
+
+
+# Create a safe wrapper for SQLDatabase
+class SafeSQLDatabase:
+    """A wrapper around SQLDatabase that adds query validation."""
+    
+    def __init__(self, db):
+        self.db = db
+    
+    def run(self, query: str, *args, **kwargs) -> str:
+        """Run a SQL query with safety validation."""
+        if not validate_sql_query(query):
+            return "Error: This query contains potentially unsafe operations and has been blocked. Please use only SELECT statements and avoid any database modifications."
+        
+        return self.db.run(query, *args, **kwargs)
+    
+    # Pass through all other attributes to the wrapped database
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+
 def _set_env(key: str):
     if key not in os.environ:
         os.environ[key] = getpass.getpass(f"{key}:")
@@ -88,8 +134,14 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
 
 
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+    # Create the original database
+    original_db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    
+    # Wrap it with our safe version
+    safe_db = SafeSQLDatabase(original_db)
+    
+    # Use the safe database in the toolkit
+    toolkit = SQLDatabaseToolkit(db=safe_db, llm=llm)
     tools = toolkit.get_tools()
 
     prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt:31156d5f")
@@ -106,7 +158,7 @@ def create_database_admin_agent():
     Only use the below tools. Only use the information returned by the below tools to construct your final answer.
     You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
 
-    DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
+    IMPORTANT: For security reasons, only SELECT queries are allowed. Any attempt to modify the database (using INSERT, UPDATE, DELETE, DROP, etc.) will be blocked by the system.
 
     To start you should ALWAYS look at the tables in the database to see what you can query.
     Do NOT skip this step.
@@ -191,4 +243,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
