@@ -21,16 +21,25 @@ LANGCHAIN_ENDPOINT = "https://api.smith.langchain.com"
 LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT")
 
 
-def _set_env(key: str):
-    if key not in os.environ:
-        os.environ[key] = getpass.getpass(f"{key}:")
+def _get_credential(key: str) -> str:
+    """
+    Get a credential securely without storing it in environment variables.
+    
+    Args:
+        key: The name of the credential to request
+        
+    Returns:
+        The credential value
+    """
+    if key in os.environ:
+        return os.environ[key]
+    return getpass.getpass(f"{key}:")
 
-
-_set_env("OPENAI_API_KEY")
-
+# Get the API key securely
+openai_api_key = _get_credential("OPENAI_API_KEY")
 
 # set llm and create team members for the lead agent to supervise
-llm = ChatOpenAI(model="gpt-4o-mini")
+llm = ChatOpenAI(model="gpt-4o-mini", api_key=openai_api_key)
 members = ["clinical_researcher", "database_admin"]
 # Our team supervisor is an LLM node. It picks the next agent to process
 # and decides when the work is completed
@@ -159,4 +168,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
