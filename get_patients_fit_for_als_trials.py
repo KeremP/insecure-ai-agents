@@ -54,10 +54,23 @@ def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"
     messages = [
         {"role": "system", "content": system_prompt},
     ] + state["messages"]
-    response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
+    
+    # Use structured output with validation
+    try:
+        response = llm.with_structured_output(Router).invoke(messages)
+        goto = response.get("next", None)
+        
+        # Validate the routing command against allowed options
+        if goto not in options:
+            print(f"Warning: Invalid routing '{goto}'. Defaulting to clinical_researcher.")
+            goto = "clinical_researcher"  # Default to a safe option
+    except Exception as e:
+        print(f"Error in LLM routing: {e}")
+        goto = "clinical_researcher"  # Default to a safe option
+    
     if goto == "FINISH":
         goto = END
+    
     return Command(goto=goto)
 
 
@@ -159,4 +172,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
