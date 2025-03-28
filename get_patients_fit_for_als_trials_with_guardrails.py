@@ -87,10 +87,73 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
+class SecureSQLDatabaseToolkit:
+    """A wrapper around SQLDatabaseToolkit that adds security validations."""
+    
+    def __init__(self, base_toolkit):
+        self.base_toolkit = base_toolkit
+        
+    def get_tools(self):
+        """Get the tools from the base toolkit but wrap their _run methods with security checks."""
+        tools = self.base_toolkit.get_tools()
+        
+        for tool in tools:
+            original_run = tool._run
+            
+            # Define a secure wrapper for the _run method
+            def secure_run(query, original_run=original_run):
+                # Validate the query before execution
+                if not self._is_safe_query(query):
+                    return "Error: This query has been blocked for security reasons. Only SELECT statements that don't modify the database are allowed."
+                
+                # If the query passes validation, execute it
+                return original_run(query)
+            
+            # Replace the original _run method with our secure version
+            tool._run = secure_run
+            
+        return tools
+    
+    def _is_safe_query(self, query):
+        """Check if a query is safe to execute."""
+        if not query or not isinstance(query, str):
+            return False
+            
+        # Convert to lowercase for easier checking
+        query_lower = query.lower().strip()
+        
+        # Block any non-SELECT statements
+        if not query_lower.startswith("select"):
+            return False
+            
+        # Block any statements with multiple queries (;)
+        if ";" in query_lower[:-1]:  # Allow semicolon at the end
+            return False
+            
+        # Block any statements with comments
+        if "--" in query_lower or "/*" in query_lower:
+            return False
+            
+        # Block any statements with potentially dangerous SQL commands
+        dangerous_keywords = [
+            "insert", "update", "delete", "drop", "alter", "truncate", 
+            "create", "grant", "revoke", "union", "exec", "execute", "xp_"
+        ]
+        
+        for keyword in dangerous_keywords:
+            if f" {keyword} " in f" {query_lower} ":  # Add spaces to ensure we match whole words
+                return False
+                
+        return True
+
+
 def create_database_admin_agent():
     db = SQLDatabase.from_uri("sqlite:///als_patients.db")
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-    tools = toolkit.get_tools()
+    base_toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+    
+    # Wrap the toolkit with our secure wrapper
+    secure_toolkit = SecureSQLDatabaseToolkit(base_toolkit)
+    tools = secure_toolkit.get_tools()
 
     prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt:31156d5f")
     assert len(prompt_template.messages) == 1
@@ -191,4 +254,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
