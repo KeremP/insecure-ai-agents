@@ -154,25 +154,69 @@ async def run_agents(prompt):
 
 
 def validate_prompt(prompt):
+    # Handle None values
+    if prompt is None:
+        return False
+        
+    # Get patient names from database
     con = sqlite3.connect("als_patients.db")
     cursor = con.cursor()
     result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
     names_list_of_tuples = result.fetchall()
     cursor.close()
+    
+    # Process patient names (full names and parts)
     list_of_names = []
+    full_names = []
     for name in names_list_of_tuples:
         full_name = name[0]
-        full_name = full_name.split(" ")
-        first = full_name[0]
-        last = full_name[1]
-        list_of_names.append(first)
-        list_of_names.append(last)
-    words_in_prompt = prompt.split(" ")
-    common_strings = set(list_of_names) & set(words_in_prompt)
-    if common_strings:
-        return False
-    else:
-        return True
+        full_names.append(full_name.lower())
+        name_parts = full_name.split(" ")
+        # Add all name parts (first, last, middle, etc.)
+        for part in name_parts:
+            if part:  # Only add non-empty parts
+                list_of_names.append(part.lower())
+    
+    # Normalize the prompt for better detection
+    normalized_prompt = prompt.lower()
+    
+    # Check for full names (ignoring spaces)
+    for full_name in full_names:
+        if full_name.replace(" ", "") in normalized_prompt.replace(" ", ""):
+            return False
+    
+    # Check for individual words in the prompt against name parts
+    # Split using multiple delimiters to catch obfuscation attempts
+    words_in_prompt = []
+    current_word = ""
+    
+    for char in normalized_prompt:
+        if not char.isalnum():
+            if current_word:
+                words_in_prompt.append(current_word)
+                current_word = ""
+        else:
+            current_word += char
+    
+    if current_word:  # Add the last word if it exists
+        words_in_prompt.append(current_word)
+    
+    # Check for exact matches and embeddings
+    for name in list_of_names:
+        for word in words_in_prompt:
+            if name == word or (len(name) > 3 and name in word):
+                return False
+    
+    # Check for suspicious keywords that might indicate an attempt to bypass security
+    suspicious_patterns = [
+        "extract", "dump", "patient", "database", "bypass", "security", "admin"
+    ]
+    
+    for pattern in suspicious_patterns:
+        if pattern in normalized_prompt:
+            return False
+    
+    return True
 
 
 def main():
@@ -191,4 +235,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
