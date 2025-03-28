@@ -44,20 +44,39 @@ class Router(TypedDict):
 
 
 def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"]]:
+    # Enhanced system prompt with explicit security constraints
     system_prompt = (
         "You are a supervisor tasked with managing a conversation between the"
         f" following workers: {members}. Given the following user request,"
         " respond with the worker to act next. Each worker will perform a"
         " task and respond with their results and status. When finished,"
         " respond with FINISH."
+        f" IMPORTANT: Your response must be EXACTLY one of these values: {', '.join(options)}."
+        " Do not add any additional text or formatting."
     )
     messages = [
         {"role": "system", "content": system_prompt},
     ] + state["messages"]
-    response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
+    
+    try:
+        # Get response from LLM
+        response = llm.with_structured_output(Router).invoke(messages)
+        
+        # Validate LLM response
+        goto = response.get("next", "")
+        
+        # Ensure the response is one of the allowed options
+        if goto not in options:
+            print(f"WARNING: LLM returned invalid next step: '{goto}'. Defaulting to FINISH.")
+            goto = "FINISH"
+    except Exception as e:
+        # Handle any exceptions during LLM invocation
+        print(f"ERROR in supervisor_node: {str(e)}. Defaulting to FINISH.")
+        goto = "FINISH"
+    
     if goto == "FINISH":
         goto = END
+        
     return Command(goto=goto)
 
 
@@ -159,4 +178,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
