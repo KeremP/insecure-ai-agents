@@ -1,6 +1,8 @@
 import getpass
 import os
 import asyncio
+import re
+import logging
 from typing import Literal
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
@@ -87,12 +89,53 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
 
 
 def create_database_admin_agent():
+    # Set up logging for security events
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("sql_security")
+    
+    # Create a secure SQL database connection
     db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    
+    # Store the original run method
+    original_run = db.run
+    
+    # Define a secure wrapper for the run method
+    def secure_run(query, *args, **kwargs):
+        # Normalize whitespace and remove comments to prevent evasion
+        normalized_query = re.sub(r'\s+', ' ', query).strip()
+        normalized_query = re.sub(r'--.*$', '', normalized_query, flags=re.MULTILINE)
+        normalized_query = re.sub(r'/\*.*?\*/', '', normalized_query, flags=re.DOTALL)
+        
+        # List of dangerous SQL operations with regex patterns to catch variations
+        dangerous_patterns = [
+            r'\b(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE|ATTACH|DETACH)\b',
+            r'\bINTO\b',  # Catches INSERT INTO
+            r'\bSET\b',   # Catches UPDATE SET
+            r';.*\b(SELECT|DROP|DELETE|UPDATE|INSERT|ALTER)\b'  # Catches chained queries
+        ]
+        
+        # Check if the query contains any dangerous patterns
+        for pattern in dangerous_patterns:
+            if re.search(pattern, normalized_query, re.IGNORECASE):
+                matched = re.search(pattern, normalized_query, re.IGNORECASE).group()
+                logger.warning(f"Blocked potentially dangerous SQL query: {query}")
+                return f"Error: The query contains a disallowed SQL operation or pattern '{matched}'. Only simple SELECT statements are permitted."
+        
+        # Verify the query starts with SELECT or similar safe operations
+        if not re.match(r'^\s*(SELECT|PRAGMA|EXPLAIN)\b', normalized_query, re.IGNORECASE):
+            logger.warning(f"Blocked non-SELECT SQL query: {query}")
+            return "Error: Only SELECT, PRAGMA, or EXPLAIN queries are allowed."
+        
+        # If the query passes validation, execute it using the original method
+        logger.info(f"Executing validated SQL query: {query}")
+        return original_run(query, *args, **kwargs)
+    
+    # Replace the database's run method with our secure version
+    db.run = secure_run
+    
+    # Create the toolkit and tools with our secured database
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
-
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
-    assert len(prompt_template.messages) == 1
 
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
@@ -159,4 +202,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
