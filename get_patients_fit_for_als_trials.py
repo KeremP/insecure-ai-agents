@@ -55,9 +55,19 @@ def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"
         {"role": "system", "content": system_prompt},
     ] + state["messages"]
     response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
+    
+    # Validate the response to ensure it contains a valid option
+    goto = response.get("next", None)
+    
+    # Check if the goto value is in the allowed options
+    if goto not in options:
+        # If invalid, log the issue and default to a safe option
+        print(f"Warning: LLM returned invalid next agent '{goto}'. Defaulting to first agent.")
+        goto = members[0]  # Default to the first agent as a fallback
+    
     if goto == "FINISH":
         goto = END
+        
     return Command(goto=goto)
 
 
@@ -159,4 +169,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
