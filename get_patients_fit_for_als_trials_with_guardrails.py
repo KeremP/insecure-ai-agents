@@ -89,7 +89,71 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
 
 def create_database_admin_agent():
     db = SQLDatabase.from_uri("sqlite:///als_patients.db")
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+    
+    # Create a secure wrapper for the database
+    class SecureSQLDatabase:
+        """A wrapper around SQLDatabase that adds SQL query validation."""
+        
+        def __init__(self, db):
+            self.db = db
+            # Expose necessary attributes from the wrapped database
+            self.engine = db.engine
+            self.dialect = db.dialect
+            self.metadata = db.metadata
+            self.sample_rows_in_table_info = db.sample_rows_in_table_info
+            self.include_tables = db.include_tables
+            self.ignore_tables = db.ignore_tables
+        
+        def validate_sql_query(self, query: str) -> bool:
+            """Validate SQL query for potential security issues."""
+            if not query or not isinstance(query, str):
+                print(f"WARNING: Invalid query format: {query}")
+                return False
+                
+            query_lower = query.lower().strip()
+            
+            # Check for disallowed operations
+            disallowed_operations = [
+                "insert into", "update ", "delete from", "drop ", "alter ", 
+                "create ", "truncate ", "exec ", "execute ", "attach ", 
+                "pragma ", "--", ";--", "/*", "*/", "xp_", ";"
+            ]
+            
+            for op in disallowed_operations:
+                if op in query_lower:
+                    print(f"WARNING: Disallowed SQL operation detected: {op} in query: {query}")
+                    return False
+            
+            # Only allow SELECT statements
+            if not query_lower.startswith("select "):
+                print(f"WARNING: Non-SELECT statement detected: {query}")
+                return False
+                
+            return True
+        
+        def run(self, query, *args, **kwargs):
+            """Run a SQL query with validation."""
+            if not self.validate_sql_query(query):
+                raise ValueError("Potentially unsafe SQL query detected and blocked")
+            return self.db.run(query, *args, **kwargs)
+        
+        def run_no_throw(self, query, *args, **kwargs):
+            """Run a SQL query with validation, doesn't throw on empty result."""
+            if not self.validate_sql_query(query):
+                raise ValueError("Potentially unsafe SQL query detected and blocked")
+            return self.db.run_no_throw(query, *args, **kwargs)
+        
+        def get_table_info(self, *args, **kwargs):
+            """Get table info - pass through to the wrapped database."""
+            return self.db.get_table_info(*args, **kwargs)
+        
+        def get_usable_table_names(self, *args, **kwargs):
+            """Get usable table names - pass through to the wrapped database."""
+            return self.db.get_usable_table_names(*args, **kwargs)
+
+    # Wrap the database with our secure wrapper
+    secure_db = SecureSQLDatabase(db)
+    toolkit = SQLDatabaseToolkit(db=secure_db, llm=llm)
     tools = toolkit.get_tools()
 
     prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt:31156d5f")
@@ -191,4 +255,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
