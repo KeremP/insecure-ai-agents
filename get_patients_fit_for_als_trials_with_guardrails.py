@@ -3,6 +3,7 @@ import os
 import asyncio
 import argparse
 import sqlite3
+import re  # Added for regex support
 from typing import Literal
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
@@ -153,26 +154,71 @@ async def run_agents(prompt):
         print("----")
 
 
+def normalize_text(text):
+    """
+    Normalize text by converting to lowercase and removing punctuation.
+    """
+    if text is None:
+        return ""
+    
+    # Convert to lowercase
+    text = text.lower()
+    
+    # Remove punctuation and non-alphanumeric chars except spaces
+    text = re.sub(r'[^\w\s]', '', text)
+    
+    return text
+
+
 def validate_prompt(prompt):
+    """
+    Validate that the prompt doesn't contain patient names using robust matching.
+    Returns True if the prompt is valid (no patient names found), False otherwise.
+    """
+    if prompt is None or prompt.strip() == "":
+        return False  # Reject empty prompts
+    
+    # Normalize the prompt
+    normalized_prompt = normalize_text(prompt)
+    
+    # Remove all non-alphanumeric characters (including spaces) for compact matching
+    compact_prompt = normalized_prompt.replace(" ", "")
+    
+    # Connect to database
     con = sqlite3.connect("als_patients.db")
     cursor = con.cursor()
     result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
-    names_list_of_tuples = result.fetchall()
+    names = result.fetchall()
     cursor.close()
-    list_of_names = []
-    for name in names_list_of_tuples:
-        full_name = name[0]
-        full_name = full_name.split(" ")
-        first = full_name[0]
-        last = full_name[1]
-        list_of_names.append(first)
-        list_of_names.append(last)
-    words_in_prompt = prompt.split(" ")
-    common_strings = set(list_of_names) & set(words_in_prompt)
-    if common_strings:
-        return False
-    else:
-        return True
+    
+    # Check each patient name against the prompt
+    for name_tuple in names:
+        full_name = name_tuple[0]
+        
+        # Normalize the name
+        normalized_name = normalize_text(full_name)
+        
+        # Create a compact version of the name (no spaces)
+        compact_name = normalized_name.replace(" ", "")
+        
+        # Check if normalized name is in the normalized prompt
+        if normalized_name in normalized_prompt:
+            return False
+            
+        # Check if compact name is in compact prompt
+        if compact_name in compact_prompt:
+            return False
+        
+        # Check individual name parts
+        name_parts = normalized_name.split()
+        if len(name_parts) >= 2:
+            first_name = name_parts[0]
+            last_name = name_parts[1]
+            
+            if first_name in normalized_prompt or last_name in normalized_prompt:
+                return False
+    
+    return True  # No patient names found
 
 
 def main():
@@ -180,7 +226,8 @@ def main():
     parser.add_argument('--prompt', required=False)  # positional argument
     args = parser.parse_args()
 
-    if not validate_prompt(args.prompt):
+    # If prompt is provided, validate it before proceeding
+    if args.prompt is not None and not validate_prompt(args.prompt):
         print("Prompt failed guardrails")
         exit(1)
 
@@ -191,4 +238,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
