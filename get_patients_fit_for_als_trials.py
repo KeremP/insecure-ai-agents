@@ -1,6 +1,7 @@
 import getpass
 import os
 import asyncio
+import re  # Added for regex pattern matching
 from typing import Literal
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
@@ -87,13 +88,55 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
 
 
 def create_database_admin_agent():
+    # Create the standard SQLDatabase
     db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    
+    # Store the original run method
+    original_run = db.run
+    
+    # Define a validation function
+    def validate_sql_query(query):
+        """Validate a SQL query for safety."""
+        query = query.strip().upper()
+        
+        # Basic DML and DDL check
+        forbidden_keywords = [
+            "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", 
+            "TRUNCATE", "ATTACH", "DETACH", "PRAGMA"
+        ]
+        
+        for keyword in forbidden_keywords:
+            if keyword in query.split():
+                return False, f"Query contains forbidden keyword: {keyword}"
+        
+        # Check for suspicious patterns that might indicate SQL injection
+        suspicious_patterns = [
+            r';\s*\w+',  # Multiple statements
+            r'--',        # SQL comments
+            r'/\*'        # Block comments
+        ]
+        
+        for pattern in suspicious_patterns:
+            if re.search(pattern, query, re.IGNORECASE):
+                return False, f"Query contains suspicious pattern: {pattern}"
+        
+        return True, ""
+    
+    # Create a safe wrapper for the run method
+    def safe_run(query, *args, **kwargs):
+        is_safe, reason = validate_sql_query(query)
+        if not is_safe:
+            raise ValueError(f"Unsafe SQL query detected: {reason}")
+        return original_run(query, *args, **kwargs)
+    
+    # Replace the run method with our safe version
+    db.run = safe_run
+    
+    # Create the toolkit with our safe database
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
-
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
-    assert len(prompt_template.messages) == 1
-
+    
+    # System message remains the same
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
@@ -110,7 +153,7 @@ def create_database_admin_agent():
     To start you should ALWAYS look at the tables in the database to see what you can query.
     Do NOT skip this step.
     Then you should query the schema of the most relevant tables."""
-
+    
     sql_agent_executor = create_react_agent(llm, tools, state_modifier=system_message)
     return sql_agent_executor
 
@@ -159,4 +202,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
