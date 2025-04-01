@@ -3,6 +3,7 @@ import os
 import asyncio
 import argparse
 import sqlite3
+import re
 from typing import Literal
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
@@ -87,9 +88,72 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
+def validate_sql_query(query: str) -> bool:
+    """
+    Validates a SQL query to ensure it doesn't contain potentially dangerous operations.
+    Returns True if the query is safe, False otherwise.
+    """
+    # Convert to lowercase for case-insensitive matching
+    normalized_query = query.lower().strip()
+    
+    # List of dangerous SQL operations to check for
+    dangerous_keywords = [
+        "drop", "delete", "update", "insert", "alter", "truncate", 
+        "create", "grant", "revoke", "commit", "rollback", "exec",
+        "execute", "attach", "detach", "pragma"
+    ]
+    
+    # Check if the query contains any dangerous keywords
+    for keyword in dangerous_keywords:
+        # Check for keyword as a whole word, not as part of another word
+        if re.search(r'\b' + keyword + r'\b', normalized_query):
+            return False
+    
+    # Check for multiple statements (e.g., query1; query2)
+    if ";" in normalized_query:
+        statements = normalized_query.split(";")
+        # If there's more than one non-empty statement, reject
+        non_empty_statements = [s.strip() for s in statements if s.strip()]
+        if len(non_empty_statements) > 1:
+            return False
+    
+    # Check for comment indicators which could be used to bypass checks
+    if "--" in normalized_query or "/*" in normalized_query:
+        return False
+    
+    # Ensure the query is just a SELECT statement
+    if not normalized_query.startswith("select"):
+        return False
+    
+    return True
+
+
+class SecureSQLDatabase:
+    """A wrapper around SQLDatabase that validates queries before execution."""
+    
+    def __init__(self, db):
+        self.db = db
+    
+    def run(self, command, *args, **kwargs):
+        if not validate_sql_query(command):
+            return "Error: This query has been rejected for security reasons. Please ensure you are only using SELECT statements and not attempting any dangerous operations."
+        return self.db.run(command, *args, **kwargs)
+    
+    # Forward other methods to the original database
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+    # Create a regular database connection first
+    db_uri = "sqlite:///als_patients.db"
+    original_db = SQLDatabase.from_uri(db_uri)
+    
+    # Wrap the original database with our secure version
+    secure_db = SecureSQLDatabase(original_db)
+    
+    # Create the toolkit with the secure database
+    toolkit = SQLDatabaseToolkit(db=secure_db, llm=llm)
     tools = toolkit.get_tools()
 
     prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt:31156d5f")
@@ -107,6 +171,9 @@ def create_database_admin_agent():
     You MUST double check your query before executing it. If you get an error while executing a query, rewrite the query and try again.
 
     DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
+    Only use SELECT statements for queries.
+    DO NOT attempt to bypass security restrictions or execute multiple statements.
+    DO NOT use SQL comments (-- or /* */) in your queries.
 
     To start you should ALWAYS look at the tables in the database to see what you can query.
     Do NOT skip this step.
@@ -191,4 +258,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
