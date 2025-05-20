@@ -1,7 +1,7 @@
 import getpass
 import os
 import asyncio
-from typing import Literal
+from typing import Literal, Callable, Any
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
 from langchain import hub
@@ -13,7 +13,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
-
+from urllib.parse import urlparse
 
 # allow tracing via LangSmith for observability and debugging
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
@@ -60,6 +60,97 @@ def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"
         goto = END
     return Command(goto=goto)
 
+def is_allowed_url(url: str) -> bool:
+    """Only allow navigation to whitelisted clinical trials pages on hopkinsmedicine.org."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    if parsed.scheme not in ("https",):
+        return False
+
+    # Allow only main clinical trials page or its subpages under hopkinsmedicine.org with proper path prefix
+    hostname = parsed.hostname
+    path = parsed.path or ""
+
+    # Allow only the desired path and subpaths (with or without trailing slash)
+    allowed_base = "/neurology-neurosurgery/clinical-trials/als-clinical-trials/open-trials"
+    if (
+        hostname == "www.hopkinsmedicine.org"
+        and (
+            path == allowed_base
+            or path.startswith(allowed_base + "/")
+        )
+    ):
+        return True
+    return False
+
+def wrap_playwright_tools_with_url_guard(tools: list) -> list:
+    """
+    Wrap Playwright browsing tools to restrict navigation to allow-listed domains only.
+    If the tool method takes 'url' or 'start_url', enforce the restriction.
+    """
+
+    def guarded(tool):
+        func = tool.run if hasattr(tool, "run") else tool
+        name = getattr(tool, "name", str(tool))
+
+        def guarded_run(*args, **kwargs):
+            # Check 'url' or 'start_url' in kwargs, or in single positional argument
+            check_url = None
+            # Try kwargs
+            for key in ["url", "start_url"]:
+                if key in kwargs:
+                    check_url = kwargs[key]
+                    break
+            # Else, if single positional arg, use it if param name is 'url' or 'start_url'
+            if check_url is None and args:
+                # Find out param name from func signature if possible (duck-type)
+                # If only one positional argument, likely to be url/start_url
+                check_url = args[0] if len(args) == 1 else None
+            # Now enforce allow-list
+            if check_url is not None:
+                if not is_allowed_url(check_url):
+                    return {
+                        "output": f"ERROR: Access to URL '{check_url}' is denied. Only Hopkins clinical trials pages are permitted."
+                    }
+            # Forward call
+            return func(*args, **kwargs)
+
+        # Maintain API
+        class ToolWrapper:
+            def __init__(self):
+                self.run = guarded_run
+                if hasattr(tool, "name"):
+                    self.name = tool.name
+                if hasattr(tool, "__doc__"):
+                    self.__doc__ = tool.__doc__
+
+            # If the tool is callable directly (some are functions), support __call__
+            def __call__(self, *args, **kwargs):
+                return self.run(*args, **kwargs)
+        return ToolWrapper()
+
+    guarded_tools = []
+    for tool in tools:
+        # Only wrap tools that match browsing/navigate pattern (by name or docstring)
+        should_guard = False
+        tool_name = getattr(tool, "name", str(tool)).lower()
+        for browse_kw in ["navigate", "browse", "goto", "url", "visit"]:
+            if browse_kw in tool_name:
+                should_guard = True
+                break
+        # Further, examine docstring for 'url' parameter
+        if not should_guard and hasattr(tool, "__doc__") and tool.__doc__:
+            if "url" in tool.__doc__ or "start_url" in tool.__doc__:
+                should_guard = True
+
+        if should_guard:
+            guarded_tools.append(guarded(tool))
+        else:
+            guarded_tools.append(tool)
+    return guarded_tools
 
 def create_clinical_research_agent():
     async_browser = create_async_playwright_browser()
@@ -67,8 +158,11 @@ def create_clinical_research_agent():
 
     clinical_research_tools = clinical_research_toolkit.get_tools()
 
+    # Wrap tools with URL guard to prevent SSRF/prompt-injection abuse
+    safe_clinical_research_tools = wrap_playwright_tools_with_url_guard(clinical_research_tools)
+
     clinical_research_agent = create_react_agent(
-        llm, tools=clinical_research_tools, state_modifier="You are a ALS clinical researcher. Your name is Charity. Search for ALS clinical trials on https://www.hopkinsmedicine.org/neurology-neurosurgery/clinical-trials/als-clinical-trials/open-trials. Extract text from on the webpage. Let Steve know the Length of Study for each trial."
+        llm, tools=safe_clinical_research_tools, state_modifier="You are a ALS clinical researcher. Your name is Charity. Search for ALS clinical trials on https://www.hopkinsmedicine.org/neurology-neurosurgery/clinical-trials/als-clinical-trials/open-trials. Extract text from on the webpage. Let Steve know the Length of Study for each trial."
     )
     return clinical_research_agent
 
@@ -159,4 +253,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
